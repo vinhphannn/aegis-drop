@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import App from './App';
+import VaultGate from './VaultGate';
 import { authStore, useAuth } from './auth';
 import { itemStore } from './store';
 
@@ -11,7 +11,7 @@ export default function AuthGate() {
     if (status !== 'ready') itemStore.reset();
     setAccessKey('');
   }, [status]);
-  if (status === 'ready') return <App />;
+  if (status === 'ready') return <VaultGate />;
   return <main className="shell unlock-shell">
     <header><span className="brand"><span className="brand-mark" aria-hidden="true">↘</span> AEGIS <span>DROP</span></span></header>
     <section className="intro"><p className="eyebrow">YOUR PRIVATE DROP SPACE</p><h1>Keep it close.</h1><p>Unlock this device with your access key.</p></section>

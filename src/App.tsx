@@ -96,7 +96,7 @@ export default function App() {
         {nextCursor && <button className="load-older" disabled={unavailable} onClick={() => { void itemStore.loadOlder(); }}>{loadingOlder ? 'Loading older…' : 'Load older'}</button>}
       </section>
       <p className="status" role="status" aria-live="polite">{auth.error || error || (busy ? 'Saving…' : message)}</p>
-      <footer><span>Kept until you delete it.</span><span>Stored in the cloud · <button className="logout" disabled={unavailable} onClick={() => { void authStore.logout(); }}>Lock device</button></span></footer>
+      <footer><span>Kept until you delete it.</span><span>Stored in the cloud · <button className="logout" disabled={unavailable} onClick={() => { void authStore.logout(); }}>Sign out</button></span></footer>
     </main>
   );
 }

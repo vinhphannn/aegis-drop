@@ -1,67 +1,142 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import ts from 'typescript';
+import { moduleUrl } from './load-ts.mjs';
 
-// Exercise the actual store without introducing a test framework or DOM library.
-const source = await readFile(new URL('../src/store.ts', import.meta.url), 'utf8');
-const compiled = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText.replace("from 'react'", `from '${import.meta.resolve('react')}'`);
-const { itemStore, MAX_ITEMS } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { itemStore } = await import(await moduleUrl('src/store.ts'));
 
-test('mixed retention, file metadata, notifications, and exact URL lifetime', () => {
-  const create = URL.createObjectURL;
-  const revoke = URL.revokeObjectURL;
-  const created = [];
-  const revoked = [];
-  URL.createObjectURL = file => { const url = create(file); created.push(url); return url; };
-  URL.revokeObjectURL = url => { revoked.push(url); revoke(url); };
+test('remote store uses the API and authoritative lists, preserves text and handles failure', async () => {
+  const originalFetch = globalThis.fetch;
+  let serverItems = [];
+  const calls = [];
+  let failMutation = false;
+  let failList = false;
+  let failListOnce = false;
   let notifications = 0;
+  let malformedList = false;
+  let holdMutation = false;
+  let releaseMutation;
   const unsubscribe = itemStore.subscribe(() => notifications++);
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options });
+    if (path.startsWith('/api/items?')) {
+      if (failListOnce) { failListOnce = false; throw new Error('List temporarily unavailable'); }
+      if (failList) throw new Error('Network unavailable');
+      return Response.json(malformedList ? { items: [{ type: 'file' }] } : { items: serverItems, nextCursor: null });
+    }
+    if (failMutation) return Response.json({ error: 'Upload rejected' }, { status: 413 });
+    if (path === '/api/items/text') {
+      if (holdMutation) await new Promise(resolve => { releaseMutation = resolve; });
+      const { text } = JSON.parse(options.body);
+      serverItems = [{ id: 'text-id', type: 'text', text, createdAt: 1 }];
+    } else if (path === '/api/items/file') {
+      assert.ok(options.body instanceof File, 'send binary File without base64 or multipart');
+      assert.equal(options.headers['X-File-Size'], String(options.body.size));
+      assert.equal(options.headers['X-File-Name'], encodeURIComponent(options.body.name));
+      serverItems = [{ id: 'file-id', type: 'file', name: options.body.name,
+        mimeType: options.body.type, size: options.body.size, url: '/api/items/file-id/file', createdAt: 2 }];
+    } else if (options.method === 'DELETE') serverItems = [];
+    return Response.json({ ok: true });
+  };
   try {
-    itemStore.addText(' \n ');
-    assert.equal(itemStore.getSnapshot().length, 0);
-    assert.equal(notifications, 0);
-    const text = '  text with whitespace\n' + 'long-value'.repeat(1000);
-    itemStore.addText(text);
-    assert.equal(itemStore.getSnapshot()[0].text, text);
-    const oldSnapshot = itemStore.getSnapshot();
-    const files = Array.from({ length: 7 }, (_, i) => new File([`contents-${i}`], `${i}.txt`, { type: 'text/plain' }));
-    itemStore.addFiles(files);
-    assert.equal(oldSnapshot.length, 1, 'prior snapshots remain unchanged');
-    assert.equal(itemStore.getSnapshot().length, MAX_ITEMS);
-    assert.deepEqual(itemStore.getSnapshot().map(item => item.name), ['6.txt', '5.txt', '4.txt', '3.txt', '2.txt']);
-    assert.equal(revoked.length, 2, 'overflow files released immediately');
-    const fileItem = itemStore.getSnapshot()[0];
-    assert.equal(fileItem.file, files[6]);
-    assert.equal(fileItem.mimeType, 'text/plain');
-    assert.equal(fileItem.size, files[6].size);
-    assert.equal(fileItem.type, 'file');
-    itemStore.remove(fileItem.id);
-    assert.ok(revoked.includes(fileItem.url));
-    itemStore.addText('newest');
-    itemStore.addText('newest again');
-    assert.equal(itemStore.getSnapshot()[0].text, 'newest again');
-    assert.equal(itemStore.getSnapshot().length, MAX_ITEMS);
-    assert.equal(revoked.length, 4);
-    const ids = itemStore.getSnapshot().map(item => item.id);
-    assert.equal(new Set(ids).size, MAX_ITEMS);
-    assert.equal(notifications, 5);
-    const image = new File(['image fixture'], 'screenshot.png', { type: 'image/png' });
-    itemStore.addFiles([image]);
-    assert.equal(itemStore.getSnapshot()[0].mimeType, 'image/png');
-    assert.equal(itemStore.getSnapshot()[0].name, 'screenshot.png');
+    await Promise.all([itemStore.load(), itemStore.load()]);
+    assert.equal(calls.length, 1, 'deduplicate StrictMode startup requests');
+    assert.equal(itemStore.getSnapshot().loading, false);
+    await itemStore.addText(' \n ');
+    assert.equal(calls.length, 1);
+    const text = '  preserve whitespace\n' + 'long-text'.repeat(1000);
+    await itemStore.addText(text);
+    assert.equal(itemStore.getSnapshot().items[0].text, text);
+    assert.deepEqual(calls.slice(-2).map(call => call.path), ['/api/items/text', '/api/items?limit=5']);
+    await itemStore.addFiles([new File(['binary'], 'ảnh.png', { type: 'image/png' })]);
+    assert.equal(itemStore.getSnapshot().items.length, 1, 'use server list rather than merge local items');
+    assert.equal(itemStore.getSnapshot().items[0].name, 'ảnh.png');
+    await itemStore.remove('file-id');
+    assert.equal(itemStore.getSnapshot().items.length, 0);
+    failListOnce = true;
+    await itemStore.addText('already saved');
+    assert.ok(itemStore.getSnapshot().error?.includes('Saved'), 'successful POST must not reject merely because refresh failed');
+    await itemStore.load();
+    assert.equal(itemStore.getSnapshot().items[0].text, 'already saved');
+    malformedList = true;
+    const savedItems = itemStore.getSnapshot().items;
+    await itemStore.load();
+    assert.equal(itemStore.getSnapshot().error, 'Invalid item list response.');
+    assert.equal(itemStore.getSnapshot().items, savedItems, 'malformed responses never replace a usable snapshot');
+    malformedList = false;
+    await itemStore.load();
+    holdMutation = true;
+    const send = itemStore.addText('one send');
+    const countWhileBusy = calls.length;
+    await assert.rejects(itemStore.addText('duplicate'), /Please wait/);
+    await itemStore.load();
+    assert.equal(calls.length, countWhileBusy, 'no overlapping reload or duplicate POST while busy');
+    releaseMutation();
+    await send;
+    holdMutation = false;
+    failMutation = true;
+    await assert.rejects(itemStore.addText('retry me'), /Upload rejected/);
+    assert.equal(itemStore.getSnapshot().error, 'Upload rejected');
+    assert.equal(itemStore.getSnapshot().busy, false);
+    failList = true;
+    await itemStore.load();
+    assert.equal(itemStore.getSnapshot().error, 'Network unavailable');
+    assert.equal(itemStore.getSnapshot().loading, false);
+    failList = false;
+    await itemStore.load();
+    assert.equal(itemStore.getSnapshot().error, null);
+    assert.ok(notifications > 0);
     unsubscribe();
     const count = notifications;
-    for (const item of [...itemStore.getSnapshot()]) itemStore.remove(item.id);
-    assert.equal(notifications, count, 'unsubscribe removes listener');
-    assert.equal(itemStore.getSnapshot().length, 0);
-    assert.equal(revoked.length, created.length);
-    assert.equal(new Set(revoked).size, revoked.length, 'each URL released exactly once');
+    await itemStore.load();
+    assert.equal(notifications, count);
   } finally {
     unsubscribe();
-    URL.createObjectURL = create;
-    URL.revokeObjectURL = revoke;
+    globalThis.fetch = originalFetch;
   }
+});
+
+test('history loads only on request, appends and deduplicates, retries failures and serializes requests', async () => {
+  const originalFetch = globalThis.fetch;
+  const item = (id, createdAt) => ({ id, createdAt, type: 'text', text: id });
+  const calls = [];
+  let failOlder = false;
+  let release;
+  let hold = false;
+  globalThis.fetch = async path => {
+    calls.push(path);
+    const cursor = new URL(path, 'http://localhost').searchParams.get('cursor');
+    if (!cursor) return Response.json({ items: [item('b', 10), item('a', 10)], nextCursor: 'older-token' });
+    assert.equal(cursor, 'older-token');
+    if (hold) await new Promise(resolve => { release = resolve; });
+    if (failOlder) throw new Error('Older page unavailable');
+    // Deliberate overlap exercises defensive deduplication, independent of SQL.
+    return Response.json({ items: [item('a', 10), item('z', 9), item('y', 9)], nextCursor: null });
+  };
+  try {
+    await itemStore.load();
+    assert.deepEqual(calls, ['/api/items?limit=5'], 'startup never auto-fetches history');
+    const initial = itemStore.getSnapshot().items;
+    failOlder = true;
+    await itemStore.loadOlder();
+    assert.equal(itemStore.getSnapshot().items, initial);
+    assert.equal(itemStore.getSnapshot().nextCursor, 'older-token');
+    assert.equal(itemStore.getSnapshot().error, 'Older page unavailable');
+    failOlder = false; hold = true;
+    const older = itemStore.loadOlder();
+    assert.equal(itemStore.getSnapshot().loadingOlder, true);
+    const count = calls.length;
+    await itemStore.loadOlder();
+    await itemStore.load();
+    await assert.rejects(itemStore.addText('overlap'), /Please wait/);
+    assert.equal(calls.length, count, 'no overlapping requests can overwrite an older-page result');
+    release(); await older;
+    assert.deepEqual(itemStore.getSnapshot().items.map(item => item.id), ['b', 'a', 'z', 'y']);
+    assert.equal(itemStore.getSnapshot().nextCursor, null);
+    assert.equal(itemStore.getSnapshot().loadingOlder, false);
+    assert.equal(itemStore.getSnapshot().error, null);
+    await itemStore.loadOlder();
+    assert.equal(calls.length, count, 'end of history makes no request');
+    await itemStore.load();
+    assert.deepEqual(itemStore.getSnapshot().items.map(item => item.id), ['b', 'a'], 'Refresh deliberately starts at the newest page');
+  } finally { globalThis.fetch = originalFetch; }
 });

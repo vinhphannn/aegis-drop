@@ -1,6 +1,6 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ClipboardEvent, DragEvent, FormEvent } from 'react';
-import { itemStore, MAX_ITEMS, useItems } from './store';
+import { itemStore, MAX_FILE_SIZE, useItems } from './store';
 import type { DropItem } from './store';
 
 function formatSize(bytes: number) {
@@ -10,7 +10,7 @@ function formatSize(bytes: number) {
   return `${(bytes / divisor).toFixed(1)} ${unit}`;
 }
 
-function ItemCard({ item, announce }: { item: DropItem; announce: (message: string) => void }) {
+function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message: string) => void; busy: boolean }) {
   const [copied, setCopied] = useState(false);
   async function copy() {
     if (item.type !== 'text') return;
@@ -35,23 +35,27 @@ function ItemCard({ item, announce }: { item: DropItem; announce: (message: stri
       </>}
       <div className="item-actions">
         {item.type === 'text' ? <button onClick={copy}>{copied ? 'Copy again' : 'Copy text'} <span aria-hidden="true">⧉</span></button> : <a href={item.url} download={item.name}>Download <span aria-hidden="true">↓</span></a>}
-        <button className="delete" aria-label={`Delete ${item.type === 'text' ? 'text item' : item.name}`} onClick={() => { itemStore.remove(item.id); announce('Item deleted.'); }}>Delete</button>
+        <button className="delete" disabled={busy} aria-label={`Delete ${item.type === 'text' ? 'text item' : item.name}`} onClick={async () => { try { await itemStore.remove(item.id); announce('Item deleted.'); } catch { /* Store displays request errors. */ } }}>Delete</button>
       </div>
     </article>
   );
 }
 
 export default function App() {
-  const items = useItems();
+  const { items, nextCursor, loading, loadingOlder, busy, error } = useItems();
+  const unavailable = loading || loadingOlder || busy;
+  useEffect(() => { void itemStore.load(); }, []);
   const [text, setText] = useState('');
   const [message, setMessage] = useState('');
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
   const picker = useRef<HTMLInputElement>(null);
-  function addFiles(files: File[]) {
+  async function addFiles(files: File[]) {
     if (!files.length) return;
-    itemStore.addFiles(files);
-    setMessage(`${files.length === 1 ? 'File' : `${files.length} files`} added. Keeping the ${MAX_ITEMS} newest items.`);
+    if (unavailable) return;
+    if (files.some(file => file.size > MAX_FILE_SIZE)) { setMessage('Files are limited to 100 MiB each.'); return; }
+    try { await itemStore.addFiles(files); } catch { return; }
+    setMessage(`${files.length === 1 ? 'File' : `${files.length} files`} added.`);
   }
   function paste(event: ClipboardEvent<HTMLTextAreaElement>) {
     const files = Array.from(event.clipboardData.files);
@@ -59,6 +63,7 @@ export default function App() {
   }
   function drop(event: DragEvent<HTMLElement>) {
     event.preventDefault(); dragDepth.current = 0; setDragging(false);
+    if (unavailable) return;
     const files = Array.from(event.dataTransfer.files);
     if (files.length) addFiles(files);
     else {
@@ -66,28 +71,30 @@ export default function App() {
       if (droppedText) setText(current => current + droppedText);
     }
   }
-  function send(event: FormEvent) {
+  async function send(event: FormEvent) {
     event.preventDefault();
     if (!text.trim()) return;
-    itemStore.addText(text); setText(''); setMessage('Text added.');
+    if (unavailable) return;
+    try { await itemStore.addText(text); setText(''); setMessage('Text added.'); } catch { /* Keep unsent text. */ }
   }
   return (
     <main className="shell">
-      <header><a className="brand" href="./" aria-label="AEGIS Drop home"><span className="brand-mark" aria-hidden="true">↘</span> AEGIS <span>DROP</span></a><span className="local-badge"><i /> Local session</span></header>
+      <header><a className="brand" href="./" aria-label="AEGIS Drop home"><span className="brand-mark" aria-hidden="true">↘</span> AEGIS <span>DROP</span></a><span className="local-badge"><i /> Cloud storage</span></header>
       <section className="intro"><p className="eyebrow">YOUR EVERYDAY DROP SPACE</p><h1>A little less friction.</h1><p>Text, images, files. Drop it here, keep it handy.</p></section>
       <form className={`composer ${dragging ? 'dragging' : ''}`} onSubmit={send} onDragEnter={event => { event.preventDefault(); dragDepth.current++; setDragging(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { event.preventDefault(); dragDepth.current--; if (dragDepth.current <= 0) setDragging(false); }} onDrop={drop}>
         <label className="sr-only" htmlFor="drop-text">Text to share</label>
-        <textarea id="drop-text" placeholder="Type or paste something…" value={text} onChange={event => setText(event.target.value)} onPaste={paste} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
-        <div className="composer-bottom"><div><button type="button" className="attach" onClick={() => picker.current?.click()}><span aria-hidden="true">＋</span> Add files</button><span className="drop-hint">or drop them anywhere in this box</span></div><button className="send" type="submit" disabled={!text.trim()}>Send text <span aria-hidden="true">↗</span></button></div>
-        <input className="sr-only" ref={picker} tabIndex={-1} type="file" multiple aria-label="Choose files" onChange={event => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
+        <textarea disabled={unavailable} id="drop-text" placeholder="Type or paste something…" value={text} onChange={event => setText(event.target.value)} onPaste={paste} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+        <div className="composer-bottom"><div><button type="button" className="attach" disabled={unavailable} onClick={() => picker.current?.click()}><span aria-hidden="true">＋</span> Add files</button><span className="drop-hint">or drop them anywhere in this box</span></div><button className="send" type="submit" disabled={unavailable || !text.trim()}>Send text <span aria-hidden="true">↗</span></button></div>
+        <input className="sr-only" ref={picker} tabIndex={-1} type="file" multiple disabled={unavailable} aria-label="Choose files" onChange={event => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
         {dragging && <div className="drop-overlay">Drop to add <span>Images and files welcome</span></div>}
       </form>
       <div className="composer-note"><span>Paste screenshots directly into the text box.</span><span className="keyboard-hint">⌘ / Ctrl + Enter to send</span></div>
-      <section className="recent" aria-labelledby="recent-title"><div className="section-heading"><h2 id="recent-title">Recent drops <span>{items.length} / {MAX_ITEMS}</span></h2><p>Newest first</p></div>
-        {items.length ? <div className="items">{items.map(item => <ItemCard key={item.id} item={item} announce={setMessage} />)}</div> : <div className="empty"><span aria-hidden="true">↘</span><h3>Room for your next thought.</h3><p>Send some text or add a file to get started.</p></div>}
+      <section className="recent" aria-labelledby="recent-title"><div className="section-heading"><h2 id="recent-title">Recent drops <span>{items.length} loaded</span></h2><button className="refresh" disabled={unavailable} onClick={() => { setMessage(''); void itemStore.load(); }}>Refresh ↻</button></div>
+        {loading ? <p className="loading">Loading drops…</p> : items.length ? <div className="items">{items.map(item => <ItemCard key={item.id} item={item} announce={setMessage} busy={unavailable} />)}</div> : <div className="empty"><span aria-hidden="true">↘</span><h3>Room for your next thought.</h3><p>Send some text or add a file to get started.</p></div>}
+        {nextCursor && <button className="load-older" disabled={unavailable} onClick={() => { void itemStore.loadOlder(); }}>{loadingOlder ? 'Loading older…' : 'Load older'}</button>}
       </section>
-      <p className="status" role="status" aria-live="polite">{message}</p>
-      <footer><span>Just the 5 newest. Always light.</span><span>Stored in this tab only · Clears on refresh</span></footer>
+      <p className="status" role="status" aria-live="polite">{error || (busy ? 'Saving…' : message)}</p>
+      <footer><span>Kept until you delete it.</span><span>Stored in the cloud · Refresh to sync</span></footer>
     </main>
   );
 }

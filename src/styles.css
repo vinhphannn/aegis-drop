@@ -506,3 +506,31 @@ footer {
 
 
 }
+
+.refresh {
+  background: none;
+  border: 0;
+  color: #bed8ab;
+  font: inherit;
+  font-size: 12px;
+  min-height: 44px;
+  padding: 8px;
+}
+
+.loading {
+  color: #adbba5;
+  font-size: 14px;
+  padding: 24px 0;
+}
+
+.load-older {
+  display: block;
+  margin: 20px auto 0;
+  padding: 8px 16px;
+  min-height: 44px;
+  background: none;
+  border: 1px solid #343e31;
+  border-radius: 8px;
+  color: #94a18e;
+  font-size: 12px;
+}

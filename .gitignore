@@ -7,3 +7,6 @@ dist/
 .aws
 .codex/
 .agents/
+.wrangler/
+.dev.vars
+.dev.vars.*

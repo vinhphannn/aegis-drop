@@ -7,7 +7,7 @@ import { DirectPeer, validateSendFile } from './peer';
 import type { ReceivedItem, FileTransfer } from './peer';
 
 const ROOT_URL = 'https://vinhphannn.github.io/aegis-drop/';
-const HOST_ID = 'aegis-drop-vinhphannn-personal-v1';
+const HOST_ID = 'aegis-drop-vinhphannn-personal-protocol-2';
 
 function deviceLabel() {
   const ua = navigator.userAgent;
@@ -24,6 +24,7 @@ export default function App() {
   const [, refresh] = useState(0);
   const [localFailures, setLocalFailures] = useState<FileTransfer[]>([]);
   const fileBusy = useRef(false);
+  const disconnectActions = useRef(new Map<string, () => void>());
   const connections = useRef(new Map<string, DirectPeer>());
   const picker = useRef<HTMLInputElement>(null), panelRoot = useRef<HTMLDivElement>(null);
   const local = useRef({ id: crypto.randomUUID(), label: deviceLabel() });
@@ -34,9 +35,11 @@ export default function App() {
     const options = { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } };
     let peer: Peer;
     let isHost = true;
+    const blocked = new Set<string>();
+    const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
     const livePeers = new Map<string, { connection: DataConnection; store: DirectPeer }>();
     const connectTo = (id: string) => {
-      if (!alive || id === peer.id || livePeers.has(id)) return;
+      if (!alive || blocked.has(id) || id === peer.id || livePeers.has(id)) return;
       accept(peer.connect(id, { label: 'aegis-drop-v1', reliable: true, serialization: 'raw', metadata: { session: crypto.randomUUID() } }));
     };
     const broadcastPeers = () => {
@@ -50,6 +53,12 @@ export default function App() {
       store.onVersionMismatch = () => { void checkVersion(fileBusy.current).then(message => { if (alive && message) setMessage(message); }); };
       livePeers.set(connection.peer, { connection, store });
       stores.set(connection.connectionId, store);
+      disconnectActions.current.set(connection.connectionId, () => { blocked.add(connection.peer); store.disconnect(); });
+      const timeout = setTimeout(() => {
+        pendingTimers.delete(timeout);
+        if (store.getSnapshot().status !== 'connected') connection.close();
+      }, 12000);
+      pendingTimers.add(timeout);
       if (connection.peer === HOST_ID) store.onPeers = ids => {
         for (const id of ids) if (peer.id < id) connectTo(id);
       };
@@ -65,12 +74,14 @@ export default function App() {
         }
       }));
       connection.on('close', () => {
+        clearTimeout(timeout); pendingTimers.delete(timeout);
         if (livePeers.get(connection.peer)?.connection === connection) {
           livePeers.delete(connection.peer);
           if (alive) broadcastPeers();
         }
       });
       connection.on('open', () => {
+        clearTimeout(timeout); pendingTimers.delete(timeout);
         if (!alive) return;
         if (typeof connection.metadata?.session !== 'string') { connection.close(); return; }
         store.connect(connection, connection.metadata.session);
@@ -89,10 +100,15 @@ export default function App() {
       });
     };
     peer = new Peer(HOST_ID, options); setup(peer);
+    const retry = setInterval(() => {
+      if (!alive || peer.destroyed) return;
+      if (peer.disconnected) { peer.reconnect(); return; }
+      if (!isHost && peer.open) connectTo(HOST_ID);
+    }, 3000);
     setLink(ROOT_URL);
     QRCode.toDataURL(ROOT_URL, { width: 240, margin: 2 }).then(value => { if (alive) setQr(value); }).catch(() => { if (alive) setMessage('Share unavailable.'); });
     return () => {
-      alive = false; unsubscribers.forEach(off => off());
+      alive = false; clearInterval(retry); pendingTimers.forEach(clearTimeout); disconnectActions.current.clear(); unsubscribers.forEach(off => off());
       for (const store of stores.values()) {
         const items = store.getSnapshot().items;
         store.disconnect();
@@ -191,7 +207,7 @@ export default function App() {
       <button aria-expanded={panel === 'devices'} onClick={() => setPanel(panel === 'devices' ? null : 'devices')}>Devices</button>
       <button aria-expanded={panel === 'share'} onClick={() => setPanel(panel === 'share' ? null : 'share')}>Share</button>
       {panel === 'share' && <div className="popover share" role="dialog" aria-label="Share">{qr && <img src={qr} alt="Connection QR code" />}<button disabled={!link} onClick={() => { void navigator.clipboard.writeText(link).catch(() => setMessage('Copy failed.')); }}>Copy link</button></div>}
-      {panel === 'devices' && <div className="popover devices" role="dialog" aria-label="Connected devices"><h2>Connected devices</h2><div className="device"><span>● {local.current.label} <small>(This device)</small></span></div>{connected.map(([id, store]) => <div className="device" key={id}><span>● {store.getSnapshot().device?.label ?? 'Browser'}</span><button onClick={() => store.disconnect()}>Disconnect</button></div>)}</div>}
+      {panel === 'devices' && <div className="popover devices" role="dialog" aria-label="Connected devices"><h2>Connected devices</h2><div className="device"><span>● {local.current.label} <small>(This device)</small></span></div>{connected.map(([id, store]) => <div className="device" key={id}><span>● {store.getSnapshot().device?.label ?? 'Browser'}</span><button onClick={() => disconnectActions.current.get(id)?.()}>Disconnect</button></div>)}</div>}
     </div></header>
     <div className={`composer ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); void files(Array.from(event.dataTransfer.files)); }}>
       <textarea aria-label="Message" placeholder="Paste text, image or drop a file..." value={text} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} onPaste={event => { const list = Array.from(event.clipboardData.files); if (list.length) { event.preventDefault(); void files(list); } }} />

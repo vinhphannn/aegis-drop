@@ -208,3 +208,18 @@ test('old clients are rejected before sending unverified files', async () => {
     assert.match(b.getSnapshot().error, /older version/);
   } finally { peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
 });
+
+
+test('compatible protocol connects despite different app build versions', async () => {
+  try {
+    const { a, b } = await connect();
+    let checked = false; b.onVersionMismatch = () => { checked = true; };
+    a.channel.send(JSON.stringify({ v: 1, session: a.session, type: 'hello', protocol: 2, appVersion: 'another-compatible-build' }));
+    await until(() => checked);
+    assert.equal(b.getSnapshot().status, 'connected');
+    a.sendText('still connected');
+    await until(() => b.getSnapshot().items[0]?.text === 'still connected');
+    await a.sendFile(new File(['verified'], 'compatible.bin'));
+    assert.equal(b.getSnapshot().transfers[0].phase, 'received');
+  } finally { peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
+});

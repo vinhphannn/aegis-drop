@@ -173,10 +173,11 @@ export class DirectPeer {
     check(data.length <= MAX_CONTROL_BYTES && encoder.encode(data).length <= MAX_CONTROL_BYTES);
     const value = JSON.parse(data); check(value && value.v === 1 && value.session === this.session);
     if (value.type === 'hello') {
-      if (value.protocol !== 2 || value.appVersion !== APP_VERSION) {
+      if (value.protocol !== 2) {
         this.onVersionMismatch?.();
         throw new Error('Other device uses an older version. Reload both devices.');
       }
+      if (value.appVersion !== APP_VERSION) this.onVersionMismatch?.();
       if (value.device) check(typeof value.device.id === 'string' && uuid.test(value.device.id) && typeof value.device.label === 'string' && value.device.label.length <= 80);
       this.hello = true; this.update({ status: 'connected', error: null, device: value.device }); return;
     }

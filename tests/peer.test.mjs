@@ -2,28 +2,35 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import wrtc from '@roamhq/wrtc';
 import { moduleUrl } from './load-ts.mjs';
-const { DirectPeer, parseSignal, validFile, MAX_FILE_BYTES, MAX_TEXT_BYTES, CHUNK_BYTES } = await import(await moduleUrl('src/peer.ts'));
-const peers = [];
-const make = () => { const peer = new DirectPeer(() => new wrtc.RTCPeerConnection({ iceServers: [] })); peers.push(peer); return peer; };
+const { DirectPeer, validFile, MAX_FILE_BYTES, MAX_TEXT_BYTES, CHUNK_BYTES } = await import(await moduleUrl('src/peer.ts'));
+const peers = [], connections = [];
+const make = () => { const peer = new DirectPeer(); peers.push(peer); return peer; };
 async function until(predicate, milliseconds = 10000) {
   const deadline = Date.now() + milliseconds;
   while (!predicate()) { assert.ok(Date.now() < deadline, 'timed out waiting for the real RTC peer'); await new Promise(resolve => setTimeout(resolve, 10)); }
 }
 async function connect() {
-  const a = make(), b = make(); await a.create();
-  assert.equal(a.getSnapshot().status, 'waiting-answer'); await b.join(a.getSnapshot().signal);
-  await a.acceptAnswer(b.getSnapshot().signal);
+  const a = make(), b = make();
+  const pcA = new wrtc.RTCPeerConnection({ iceServers: [] }), pcB = new wrtc.RTCPeerConnection({ iceServers: [] });
+  connections.push(pcA, pcB);
+  const session = crypto.randomUUID(); a.session = session; b.session = session;
+  pcA.onicecandidate = event => { if (event.candidate) void pcB.addIceCandidate(event.candidate); };
+  pcB.onicecandidate = event => { if (event.candidate) void pcA.addIceCandidate(event.candidate); };
+  pcB.ondatachannel = event => b.attach(event.channel, b.epoch);
+  a.attach(pcA.createDataChannel('aegis-drop-v1', { ordered: true }), a.epoch);
+  await pcA.setLocalDescription(await pcA.createOffer()); await pcB.setRemoteDescription(pcA.localDescription);
+  await pcB.setLocalDescription(await pcB.createAnswer()); await pcA.setRemoteDescription(pcB.localDescription);
   await until(() => a.getSnapshot().status === 'connected' && b.getSnapshot().status === 'connected');
   return { a, b };
 }
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jkZkAAAAASUVORK5CYII=', 'base64');
 
-test('two native WebRTC peers, manual signaling and real encrypted DataChannel transfers', async t => {
+test('two native WebRTC peers, real encrypted DataChannel transfers', async t => {
   try {
     const { a, b } = await connect();
     await t.test('text travels in both directions, including exact Unicode and whitespace', async () => {
       a.sendText('  Xin chào 🌿\n漢字  '); b.sendText('reply from B');
-      await until(() => b.getSnapshot().items.length === 1 && a.getSnapshot().items.length === 1);
+      await until(() => b.getSnapshot().items.length === 2 && a.getSnapshot().items.length === 2);
       assert.equal(b.getSnapshot().items[0].text, '  Xin chào 🌿\n漢字  ');
       assert.equal(a.getSnapshot().items[0].text, 'reply from B');
     });
@@ -47,8 +54,8 @@ test('two native WebRTC peers, manual signaling and real encrypted DataChannel t
     });
     await t.test('opposite directions can transfer files simultaneously', async () => {
       await Promise.all([a.sendFile(new File(['from A'], 'a.bin')), b.sendFile(new File(['from B'], 'b.bin'))]);
-      assert.equal(await (await fetch(b.getSnapshot().items[0].url)).text(), 'from A');
-      assert.equal(await (await fetch(a.getSnapshot().items[0].url)).text(), 'from B');
+      assert.equal(await (await fetch(b.getSnapshot().items.find(item => item.name === 'a.bin').url)).text(), 'from A');
+      assert.equal(await (await fetch(a.getSnapshot().items.find(item => item.name === 'b.bin').url)).text(), 'from B');
     });
     await t.test('HTML/SVG remain generic downloads with no previews', async () => {
       for (const mime of ['text/html', 'image/svg+xml']) {
@@ -67,15 +74,10 @@ test('two native WebRTC peers, manual signaling and real encrypted DataChannel t
       a.disconnect(); await until(() => b.getSnapshot().status !== 'connected'); await assert.rejects(fetch(url));
       assert.deepEqual(b.getSnapshot().items, []);
     });
-  } finally { peers.splice(0).forEach(peer => peer.disconnect()); }
+  } finally { peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
 });
 
-test('limits and connection codes reject malformed/session-mixed inputs', async () => {
-  assert.throws(() => parseSignal('', 'offer'), /complete/);
-  assert.throws(() => parseSignal('x'.repeat(131073), 'offer'), /too large/);
-  const signal = { v: 1, type: 'offer', session: crypto.randomUUID(), sdp: 'v=0' };
-  for (const invalid of [{ ...signal, v: 2 }, { ...signal, session: 'bad' }, { ...signal, sdp: '' }, { ...signal, type: 'answer' }]) assert.throws(() => parseSignal(JSON.stringify(invalid), 'offer'));
-  assert.throws(() => parseSignal(JSON.stringify({ ...signal, type: 'answer' }), 'answer', crypto.randomUUID()), /another connection/);
+test('limits reject malformed inputs', async () => {
   for (const size of [-1, 0.5, MAX_FILE_BYTES + 1]) assert.throws(() => validFile('file.bin', 'application/octet-stream', size));
   for (const name of ['', '../escape', 'bad\nname', 'x'.repeat(4097)]) assert.throws(() => validFile(name, 'application/octet-stream', 0));
   const peer = make(); assert.throws(() => peer.sendText('not connected'), /Connect/); peer.disconnect();
@@ -90,7 +92,7 @@ test('real RTC rejects oversized sends, cross-session frames, orphan/oversized b
     pair.a.channel.send(JSON.stringify({ v: 1, session: crypto.randomUUID(), type: 'text', id: crypto.randomUUID(), text: 'wrong-session' }));
     await until(() => pair.b.getSnapshot().status === 'failed'); assert.deepEqual(pair.b.getSnapshot().items, []);
     for (const mode of ['orphan', 'oversized', 'tiny', 'incomplete', 'unknown', 'bad-json']) {
-      const { a, b } = await connect(), session = JSON.parse(a.getSnapshot().signal).session, id = crypto.randomUUID();
+      const { a, b } = await connect(), session = a.session, id = crypto.randomUUID();
       const send = value => a.channel.send(JSON.stringify({ v: 1, session, ...value }));
       if (mode === 'orphan') a.channel.send(new ArrayBuffer(1));
       if (mode === 'oversized') { send({ type: 'file-start', id, name: 'x.bin', mime: 'application/octet-stream', size: CHUNK_BYTES + 1 }); a.channel.send(new ArrayBuffer(CHUNK_BYTES + 1)); }
@@ -100,7 +102,7 @@ test('real RTC rejects oversized sends, cross-session frames, orphan/oversized b
       if (mode === 'bad-json') a.channel.send('{');
       await until(() => b.getSnapshot().status === 'failed'); assert.deepEqual(b.getSnapshot().items, []);
     }
-  } finally { peers.splice(0).forEach(peer => peer.disconnect()); }
+  } finally { peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
 });
 
 test('backpressure waits for bufferedamountlow rather than reading the whole file', async () => {
@@ -118,7 +120,7 @@ test('backpressure waits for bufferedamountlow rather than reading the whole fil
   try {
     const sending = peer.sendFile(file); await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(reads, 0);
     channel.bufferedAmount = 0; channel.dispatchEvent(new Event('bufferedamountlow')); await sending;
-    assert.equal(reads, 3); assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 3);
+    assert.equal(reads, 4); assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 3);
     assert.ok(channel.sent.filter(value => value instanceof ArrayBuffer).every(value => value.byteLength <= CHUNK_BYTES));
-  } finally { peer.channel = undefined; peer.disconnect(); peers.splice(0).forEach(peer => peer.disconnect()); }
+  } finally { peer.channel = undefined; peer.disconnect(); peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
 });

@@ -2,7 +2,7 @@ export const CHUNK_BYTES = 16 * 1024;
 export const MAX_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 12 * 1024;
-const MAX_CONTROL_BYTES = 16 * 1024, MAX_SIGNAL_BYTES = 128 * 1024;
+const MAX_CONTROL_BYTES = 16 * 1024;
 const HIGH_WATER = 256 * 1024, LOW_WATER = 64 * 1024;
 const encoder = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -12,20 +12,11 @@ export type ReceivedItem = { id: string; createdAt: number } & (
 );
 interface Progress { name: string; bytes: number; total: number }
 export interface PeerState {
-  status: 'disconnected' | 'preparing' | 'waiting-answer' | 'connecting' | 'connected' | 'failed';
-  role: 'create' | 'join' | null; signal: string; error: string | null;
+  status: 'disconnected' | 'preparing' | 'waiting' | 'connecting' | 'connected' | 'failed';
+  error: string | null; device?: { id: string; label: string };
   items: readonly ReceivedItem[]; sending: Progress | null; receiving: Progress | null;
 }
 interface Incoming { id: string; name: string; mime: string; size: number; received: number; chunks: Uint8Array[] }
-export function parseSignal(input: string, type: 'offer' | 'answer', expectedSession?: string) {
-  check(input.length <= MAX_SIGNAL_BYTES && encoder.encode(input).length <= MAX_SIGNAL_BYTES, 'Connection code is too large.');
-  let value;
-  try { value = JSON.parse(input); } catch { throw new Error('Paste the complete connection code.'); }
-  check(value && value.v === 1 && value.type === type && typeof value.session === 'string' && uuid.test(value.session) &&
-    typeof value.sdp === 'string' && value.sdp.length > 0 && value.sdp.length <= MAX_SIGNAL_BYTES, 'Invalid connection code.');
-  check(!expectedSession || value.session === expectedSession, 'Answer belongs to another connection.');
-  return value as { v: 1; type: 'offer' | 'answer'; session: string; sdp: string };
-}
 export function validFile(name: unknown, mime: unknown, size: unknown) {
   check(typeof name === 'string' && name.length > 0 && encoder.encode(name).length <= 4096 && !/[\x00-\x1f\x7f/\\]/.test(name), 'Invalid filename.');
   check(typeof mime === 'string' && mime.length <= 255 && /^[\x20-\x7e]+$/.test(mime), 'Invalid file type.');
@@ -60,9 +51,9 @@ function dispose(item: ReceivedItem) {
   if (item.type === 'file') { URL.revokeObjectURL(item.url); if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); }
 }
 export class DirectPeer {
-  private state: PeerState = { status: 'disconnected', role: null, signal: '', error: null, items: [], sending: null, receiving: null };
+  private state: PeerState = { status: 'disconnected', error: null, items: [], sending: null, receiving: null };
   private listeners = new Set<() => void>();
-  private pc?: RTCPeerConnection;
+  private connection?: import('peerjs').DataConnection;
   private channel?: RTCDataChannel;
   private session = '';
   private epoch = 0;
@@ -71,79 +62,42 @@ export class DirectPeer {
   private finishing = false;
   private seen = new Set<string>();
   private ack?: { id: string; resolve: () => void; reject: (error: Error) => void };
-  constructor(private readonly createPeer = () => new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })) {}
+
+  constructor(private readonly localDevice?: { id: string; label: string }) {}
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   getSnapshot = () => this.state;
   private update(patch: Partial<PeerState>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(fn => fn()); }
   disconnect = () => {
     this.epoch++; this.ack?.reject(new Error('Connection closed.')); this.ack = undefined;
-    this.channel?.close(); this.pc?.close(); this.pc = undefined; this.channel = undefined; this.hello = false;
+    this.connection?.close(); this.connection = undefined; this.channel?.close(); this.channel = undefined; this.hello = false;
     if (this.incoming) for (const chunk of this.incoming.chunks) chunk.fill(0);
-    this.incoming = undefined; this.finishing = false; this.seen.clear(); this.state.items.forEach(dispose);
-    this.update({ status: 'disconnected', role: null, signal: '', error: null, items: [], sending: null, receiving: null });
+    this.incoming = undefined; this.finishing = false; this.seen.clear(); if (!this.localDevice) this.state.items.forEach(dispose);
+    this.update({ status: 'disconnected', error: null, items: this.localDevice ? this.state.items : [], sending: null, receiving: null });
   };
   private fail(error: unknown) { const message = error instanceof Error ? error.message : 'Connection failed.'; this.disconnect(); this.update({ status: 'failed', error: message }); }
-  private start(session: string, role: 'create' | 'join') {
-    this.disconnect(); this.session = session;
-    const pc = this.createPeer(); this.pc = pc; const epoch = this.epoch; this.update({ status: 'preparing', role });
-    pc.onconnectionstatechange = () => {
-      if (epoch === this.epoch && ['failed', 'closed', 'disconnected'].includes(pc.connectionState)) this.fail(new Error('Connection lost. Create or join again; some networks require TURN.'));
-    };
-    pc.ondatachannel = event => { if (epoch === this.epoch) { try { this.attach(event.channel, epoch); } catch (error) { this.fail(error); } } };
-    return { pc, epoch };
-  }
-  private async gather(pc: RTCPeerConnection, epoch: number) {
-    if (pc.iceGatheringState !== 'complete') await new Promise<void>((resolve, reject) => {
-      const finish = (error?: Error) => { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', changed); pc.removeEventListener('signalingstatechange', changed); error ? reject(error) : resolve(); };
-      const changed = () => {
-        if (epoch !== this.epoch || pc.signalingState === 'closed') finish(new Error('Connection closed.'));
-        else if (pc.iceGatheringState === 'complete') finish();
-      };
-      const timer = setTimeout(() => finish(new Error('Could not gather connection candidates. Try again or use another network.')), 20000);
-      pc.addEventListener('icegatheringstatechange', changed); pc.addEventListener('signalingstatechange', changed); changed();
-    });
-    check(epoch === this.epoch, 'Connection closed.');
-  }
-  async create() {
-    let epoch = -1;
-    try {
-      const started = this.start(crypto.randomUUID(), 'create'); const pc = started.pc; epoch = started.epoch;
-      this.attach(pc.createDataChannel('aegis-drop-v1', { ordered: true }), epoch);
-      await pc.setLocalDescription(await pc.createOffer()); await this.gather(pc, epoch);
-      this.update({ status: 'waiting-answer', signal: JSON.stringify({ v: 1, type: 'offer', session: this.session, sdp: pc.localDescription!.sdp }) });
-    } catch (error) { if (epoch === this.epoch) this.fail(error); throw error; }
-  }
-  async join(offer: string) {
-    const value = parseSignal(offer, 'offer'); let epoch = -1;
-    try {
-      const started = this.start(value.session, 'join'); const pc = started.pc; epoch = started.epoch;
-      await pc.setRemoteDescription({ type: 'offer', sdp: value.sdp }); await pc.setLocalDescription(await pc.createAnswer()); await this.gather(pc, epoch);
-      if (this.state.status !== 'connected') this.update({ status: 'connecting' });
-      this.update({ signal: JSON.stringify({ v: 1, type: 'answer', session: this.session, sdp: pc.localDescription!.sdp }) });
-    } catch (error) { if (epoch === this.epoch) this.fail(error); throw error; }
-  }
-  async acceptAnswer(answer: string) {
-    check(this.state.status === 'waiting-answer' && this.pc, 'Create an offer first.');
-    const value = parseSignal(answer, 'answer', this.session), pc = this.pc, epoch = this.epoch;
-    await pc.setRemoteDescription({ type: 'answer', sdp: value.sdp });
-    if (epoch === this.epoch && this.getSnapshot().status !== 'connected') this.update({ status: 'connecting' });
+  setStatus(status: PeerState['status'], error: string | null = null) { this.update({ status, error }); }
+  connect(connection: import('peerjs').DataConnection, session: string) {
+    if (this.channel) { connection.close(); return; }
+    this.connection = connection; this.session = session;
+    this.attach(connection.dataChannel, this.epoch);
   }
   private attach(channel: RTCDataChannel, epoch: number) {
     if (this.channel && this.channel !== channel) { channel.close(); return; }
-    check(channel.label === 'aegis-drop-v1' && channel.ordered);
+    check(channel.ordered);
     this.channel = channel; channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = LOW_WATER;
-    const opened = () => { if (epoch === this.epoch) this.control({ type: 'hello' }); };
-    channel.onopen = opened;
-    channel.onclose = () => { if (epoch === this.epoch) this.fail(new Error('Connection closed. Create or join again.')); };
-    channel.onerror = () => { if (epoch === this.epoch) this.fail(new Error('Data transfer failed.')); };
-    channel.onmessage = event => { if (epoch === this.epoch) { try { this.receive(event.data, epoch); } catch (error) { this.fail(error); } } };
+    const opened = () => { if (epoch === this.epoch) this.control({ type: 'hello', device: this.localDevice }); };
+    channel.addEventListener('open', opened);
+    channel.addEventListener('close', () => { if (epoch === this.epoch) this.fail(new Error('Connection closed. Reload to reconnect.')); });
+    channel.addEventListener('error', () => { if (epoch === this.epoch) this.fail(new Error('Data transfer failed.')); });
+    channel.addEventListener('message', event => { if (epoch === this.epoch) { try { this.receive(event.data, epoch); } catch (error) { this.fail(error); } } });
     if (channel.readyState === 'open') opened();
   }
   private control(value: Record<string, unknown>) {
     check(this.channel?.readyState === 'open', 'Connect to the other device first.');
     const encoded = JSON.stringify({ ...value, v: 1, session: this.session });
-    check(encoder.encode(encoded).length <= MAX_CONTROL_BYTES, 'Message is too large.'); this.channel.send(encoded);
+    check(encoder.encode(encoded).length <= MAX_CONTROL_BYTES, 'Message is too large.'); this.send(encoded);
   }
+  private send(data: string | ArrayBuffer) { if (this.connection) this.connection.send(data); else this.channel!.send(data as string); }
   private ready() { check(this.hello && this.channel?.readyState === 'open' && this.state.status === 'connected', 'Connect to the other device first.'); }
   private add(item: ReceivedItem) {
     const items = [item, ...this.state.items];
@@ -161,7 +115,10 @@ export class DirectPeer {
     }
     check(data.length <= MAX_CONTROL_BYTES && encoder.encode(data).length <= MAX_CONTROL_BYTES);
     const value = JSON.parse(data); check(value && value.v === 1 && value.session === this.session);
-    if (value.type === 'hello') { this.hello = true; this.update({ status: 'connected', error: null }); return; }
+    if (value.type === 'hello') {
+      if (value.device) check(typeof value.device.id === 'string' && uuid.test(value.device.id) && typeof value.device.label === 'string' && value.device.label.length <= 80);
+      this.hello = true; this.update({ status: 'connected', error: null, device: value.device }); return;
+    }
     check(this.hello);
     if (value.type === 'text') {
       check(typeof value.id === 'string' && uuid.test(value.id) && typeof value.text === 'string' && encoder.encode(value.text).length <= MAX_TEXT_BYTES);
@@ -188,9 +145,9 @@ export class DirectPeer {
     this.add({ id: incoming.id, createdAt: Date.now(), type: 'file', name: incoming.name, mimeType: incoming.mime, size: incoming.size, url, previewUrl });
     this.finishing = false; this.update({ receiving: null }); this.control({ type: 'file-received', id: incoming.id });
   }
-  sendText(text: string) {
+  sendText(text: string, id = crypto.randomUUID()) {
     this.ready(); check(!this.state.sending, 'Please wait for the current file transfer.');
-    check(encoder.encode(text).length <= MAX_TEXT_BYTES, 'Text is limited to 12 KiB.'); this.control({ type: 'text', id: crypto.randomUUID(), text });
+    check(encoder.encode(text).length <= MAX_TEXT_BYTES, 'Text is limited to 12 KiB.'); this.control({ type: 'text', id, text }); this.add({ id, createdAt: Date.now(), type: 'text', text });
   }
   private async drain(epoch: number) {
     const channel = this.channel!; if (channel.bufferedAmount <= HIGH_WATER - CHUNK_BYTES) return;
@@ -203,10 +160,10 @@ export class DirectPeer {
     });
     check(epoch === this.epoch, 'Connection closed during transfer.');
   }
-  async sendFile(file: File) {
+  async sendFile(file: File, id = crypto.randomUUID()) {
     this.ready(); check(!this.state.sending, 'Please wait for the current file transfer.');
     const name = file.name || 'screenshot.png', mime = file.type || 'application/octet-stream'; validFile(name, mime, file.size);
-    const id = crypto.randomUUID(), epoch = this.epoch, channel = this.channel!;
+    const epoch = this.epoch, channel = this.channel!;
     this.update({ sending: { name, bytes: 0, total: file.size } });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const receipt = new Promise<void>((resolve, reject) => { this.ack = { id, resolve, reject }; }); void receipt.catch(() => {});
@@ -215,10 +172,13 @@ export class DirectPeer {
       for (let offset = 0; offset < file.size; offset += CHUNK_BYTES) {
         await this.drain(epoch); const bytes = await file.slice(offset, offset + CHUNK_BYTES).arrayBuffer();
         check(epoch === this.epoch && channel.readyState === 'open', 'Connection closed during transfer.');
-        channel.send(bytes); this.update({ sending: { name, bytes: Math.min(offset + bytes.byteLength, file.size), total: file.size } });
+        this.send(bytes); this.update({ sending: { name, bytes: Math.min(offset + bytes.byteLength, file.size), total: file.size } });
       }
       await this.drain(epoch); this.control({ type: 'file-end', id });
       timer = setTimeout(() => this.ack?.reject(new Error('Receiver did not confirm the file. Reconnect and try again.')), 30000); await receipt;
+      const previewUrl = await preview(file, mime).catch(() => undefined);
+      if (epoch === this.epoch) this.add({ id, createdAt: Date.now(), type: 'file', name, mimeType: mime, size: file.size, url: URL.createObjectURL(file.slice(0, file.size, 'application/octet-stream')), previewUrl });
+      else if (previewUrl) URL.revokeObjectURL(previewUrl);
     } catch (error) { if (epoch === this.epoch) this.fail(error); throw error; }
     finally { clearTimeout(timer); if (epoch === this.epoch) { this.ack = undefined; this.update({ sending: null }); } }
   }

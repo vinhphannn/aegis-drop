@@ -49,7 +49,8 @@ export default function FileCard({ item, transfer, history, error }: { item?: Ex
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
     } catch { error('Copy image unavailable.'); }
   }
-  return <article ref={root}>
+  const rasterImage = item && ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif', 'image/bmp'].includes(item.mimeType);
+  return <article className={rasterImage ? 'item-image' : 'item-file'} ref={root}>
     <ItemTime createdAt={item?.createdAt ?? transfer!.createdAt} />
     {imageUrl && <img className="preview" src={imageUrl} alt={name} />}
     <p>{name} <small>{formatSize(size)}</small></p><p className={phase === 'failed' ? 'error' : 'progress'} role="status">{label}</p>

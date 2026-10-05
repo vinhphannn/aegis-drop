@@ -262,7 +262,7 @@ export default function App() {
     </form>
     {syncStatus && <p className="progress" role="status">{syncStatus}</p>}
     <section className="items">{recent.map(entry => {
-      if ('type' in entry && entry.type === 'text') return <article key={entry.id}><ItemTime createdAt={entry.createdAt} /><pre>{entry.text}</pre><div className="item-actions"><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></div></article>;
+      if ('type' in entry && entry.type === 'text') return <article className="item-text" key={entry.id}><ItemTime createdAt={entry.createdAt} /><pre>{entry.text}</pre><div className="item-actions"><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></div></article>;
       const item = 'type' in entry && entry.type === 'file' ? entry : undefined;
       const transfer = grouped.get(entry.id);
       return <FileCard key={entry.id} item={item} transfer={transfer ?? (!('type' in entry) ? entry : undefined)} history={history} error={setMessage} />;

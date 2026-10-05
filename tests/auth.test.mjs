@@ -5,6 +5,31 @@ const { authStore } = await import(await moduleUrl('src/auth.ts'));
 const { dropApi } = await import(await moduleUrl('src/api/dropApi.ts'));
 const { itemStore } = await import(await moduleUrl('src/store.ts'));
 
+test('auth distinguishes unavailable, empty, non-JSON and malformed backend responses without hiding server errors', async () => {
+  const originalFetch = globalThis.fetch;
+  const cases = [
+    [() => new Response(null, { status: 500, headers: { 'Content-Type': 'text/plain' } }), /backend unavailable.*HTTP 500/i],
+    [() => new Response(null, { status: 204 }), /empty response.*HTTP 204/i],
+    [() => new Response('  ', { headers: { 'Content-Type': 'application/json' } }), /empty response.*HTTP 200/i],
+    [() => new Response('<html>upstream failure</html>', { status: 502, headers: { 'Content-Type': 'text/html' } }), /HTTP 502.*text\/html/],
+    [() => new Response('Upstream is offline', { status: 503, headers: { 'Content-Type': 'text/plain' } }), /Upstream is offline/],
+    [() => new Response('{', { headers: { 'Content-Type': 'application/json' } }), /invalid JSON/],
+    [() => Response.json({ error: 'Authentication is not configured.' }, { status: 503 }), /Authentication is not configured\./],
+    [() => Response.json({ error: 'Invalid access key.' }, { status: 401 }), /Invalid access key\./],
+    [() => { throw new TypeError('Failed to fetch'); }, /Cannot reach the authentication backend/],
+  ];
+  try {
+    for (const [response, expected] of cases) {
+      globalThis.fetch = async () => response(); await authStore.check();
+      assert.equal(authStore.getSnapshot().status, 'locked');
+      assert.match(authStore.getSnapshot().error, expected);
+      assert.ok(!authStore.getSnapshot().error.includes('JSON.parse'));
+    }
+    globalThis.fetch = async () => Response.json({ authenticated: false });
+    await authStore.check(); assert.equal(authStore.getSnapshot().error, null);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('auth startup is deduplicated, login/logout use cookies, errors and expired sessions lock the UI', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -41,11 +66,11 @@ test('auth startup is deduplicated, login/logout use cookies, errors and expired
     assert.ok(!JSON.stringify(authStore.getSnapshot()).includes('test-only-key'), 'no credential stored in auth state');
     itemStore.reset();
     await itemStore.load();
-    assert.equal(itemStore.getSnapshot().items[0].text, 'private');
+    assert.equal(itemStore.getSnapshot().items[0].decryptionError, true, 'plaintext-only server rows are never displayed');
     failLogout = true;
     await authStore.logout();
     assert.equal(authStore.getSnapshot().status, 'ready', 'failed logout is not reported as clearing the cookie');
-    assert.equal(authStore.getSnapshot().error, 'Network unavailable');
+    assert.match(authStore.getSnapshot().error, /Cannot reach the authentication backend/);
     failLogout = false;
     await authStore.logout();
     assert.equal(authStore.getSnapshot().status, 'locked');

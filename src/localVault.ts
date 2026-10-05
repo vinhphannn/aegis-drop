@@ -1,5 +1,7 @@
 import { decodeDescriptor, domain, equal, requireValue, sha256, sized, uint } from './crypto/format';
-import { createDescriptor, decrypt, encrypt, generateVault, randomBytes } from './crypto/keys';
+import { createDescriptor, decrypt, encrypt, generateItemId, generateVault, randomBytes } from './crypto/keys';
+import { openText, sealText } from './crypto/itemCrypto';
+import { encodeTextEnvelope, itemIdString, parseTextEnvelope } from './textEnvelope';
 import { decodeRootBundle, encodeRootBundle } from './crypto/recovery';
 import { VaultStorageError } from './localVaultStorage';
 
@@ -13,8 +15,28 @@ export interface UnlockedVault {
   readonly vaultId: Uint8Array; readonly epochId: Uint8Array; readonly descriptorHash: Uint8Array;
 }
 const roots = new WeakMap<UnlockedVault, CryptoKey>();
-export function releaseVault(handle: UnlockedVault) { roots.delete(handle); }
+let active: UnlockedVault | undefined;
+export function activateVault(handle: UnlockedVault) { requireValue(roots.has(handle)); active = handle; }
+export function releaseVault(handle: UnlockedVault) { if (active === handle) active = undefined; roots.delete(handle); }
+export function clearActiveVault() { if (active) releaseVault(active); }
 export const isVaultUnlocked = (handle: UnlockedVault) => roots.has(handle);
+function unlocked() {
+  const handle = active, key = handle && roots.get(handle);
+  requireValue(handle && key, 'Unlock your local vault first.');
+  return { handle, key };
+}
+function stillUnlocked(handle: UnlockedVault) { requireValue(active === handle && roots.has(handle), 'Vault locked during operation.'); }
+export async function encryptVaultText(text: string) {
+  const { handle, key } = unlocked(), itemId = generateItemId();
+  const bytes = await sealText(key, { vaultId: handle.vaultId, epochId: handle.epochId, itemId }, text, Date.now());
+  stillUnlocked(handle);
+  return { id: itemIdString(itemId), envelope: encodeTextEnvelope(bytes) };
+}
+export async function decryptVaultText(id: string, envelope: unknown) {
+  const { handle, key } = unlocked(), parsed = parseTextEnvelope(id, envelope);
+  const opened = await openText(key, parsed.bytes, { vaultId: handle.vaultId, epochId: handle.epochId, itemId: parsed.header.itemId });
+  stillUnlocked(handle); return opened.text;
+}
 const damaged = () => new VaultStorageError('damaged');
 function aad(record: Enrollment) {
   return domain('local-root/v1', uint(record.version, 2), record.vaultId, record.epochId,

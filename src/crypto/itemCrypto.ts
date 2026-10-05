@@ -1,8 +1,9 @@
 import { assertContext, decodeEnvelope, decodeHeader, decodeManifest, domain, encodeEnvelope, encodeHeader, encodeManifest } from './format';
 import type { ItemContext, Manifest, TextManifest } from './format';
 import { aesKey, decrypt, encrypt, randomBytes, vaultInfo } from './keys';
+import type { VaultSecret } from './keys';
 
-export async function sealManifest(master: Uint8Array, context: ItemContext, manifest: Manifest) {
+export async function sealManifest(master: VaultSecret, context: ItemContext, manifest: Manifest) {
   const header = encodeHeader(context, manifest.kind === 'text' ? 0 : 1), h = decodeHeader(header);
   const plain = encodeManifest(manifest), secret = randomBytes(32);
   try {
@@ -16,7 +17,7 @@ export async function sealManifest(master: Uint8Array, context: ItemContext, man
     return { envelope, fileKey };
   } finally { secret.fill(0); plain.fill(0); }
 }
-export async function openManifest(master: Uint8Array, envelope: Uint8Array, expected: ItemContext, kind: 0 | 1) {
+export async function openManifest(master: VaultSecret, envelope: Uint8Array, expected: ItemContext, kind: 0 | 1) {
   const value = decodeEnvelope(envelope), h = decodeHeader(value.header);
   assertContext(h, expected, kind);
   const wrapKey = await aesKey(master, h.vaultId, vaultInfo('item-wrap', h.vaultId, h.epochId, h.itemId), ['decrypt']);
@@ -31,9 +32,9 @@ export async function openManifest(master: Uint8Array, envelope: Uint8Array, exp
     } finally { plain.fill(0); }
   } finally { secret.fill(0); }
 }
-export async function sealText(master: Uint8Array, context: ItemContext, text: string, createdAt: number) {
+export async function sealText(master: VaultSecret, context: ItemContext, text: string, createdAt: number) {
   return (await sealManifest(master, context, { kind: 'text', text, createdAt })).envelope;
 }
-export async function openText(master: Uint8Array, envelope: Uint8Array, expected: ItemContext): Promise<TextManifest> {
+export async function openText(master: VaultSecret, envelope: Uint8Array, expected: ItemContext): Promise<TextManifest> {
   return (await openManifest(master, envelope, expected, 0)).manifest as TextManifest;
 }

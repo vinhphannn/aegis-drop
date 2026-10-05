@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ClipboardEvent, DragEvent, FormEvent } from 'react';
 import { itemStore, MAX_FILE_SIZE, useItems } from './store';
 import type { DropItem } from './store';
+import { copyTextItem } from './textClipboard';
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -14,9 +15,9 @@ function formatSize(bytes: number) {
 function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message: string) => void; busy: boolean }) {
   const [copied, setCopied] = useState(false);
   async function copy() {
-    if (item.type !== 'text') return;
+    if (item.type !== 'text' || item.decryptionError) return;
     try {
-      await navigator.clipboard.writeText(item.text);
+      await copyTextItem(item, navigator.clipboard);
       setCopied(true);
       announce('Text copied to clipboard.');
     } catch {
@@ -30,12 +31,12 @@ function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message
         <span className="item-kind">{item.type === 'text' ? 'TEXT' : image ? 'IMAGE' : 'FILE'}</span>
         <time dateTime={new Date(item.createdAt).toISOString()}>{new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
       </div>
-      {item.type === 'text' ? <pre className="text-preview">{item.text}</pre> : <>
+      {item.type === 'text' ? item.decryptionError ? <p className="text-preview" role="status">Could not decrypt this text. It may be damaged or belong to another vault.</p> : <pre className="text-preview">{item.text}</pre> : <>
         {image && <a className="image-preview" href={item.url} download={item.name} aria-label={`Download ${item.name}`}><img src={item.url} alt={item.name} /></a>}
         <div className="file-info"><span className="file-symbol" aria-hidden="true">{image ? '▧' : '↧'}</span><div><p className="filename">{item.name}</p><p className="file-size">{formatSize(item.size)}</p></div></div>
       </>}
       <div className="item-actions">
-        {item.type === 'text' ? <button onClick={copy}>{copied ? 'Copy again' : 'Copy text'} <span aria-hidden="true">⧉</span></button> : <a href={item.url} download={item.name}>Download <span aria-hidden="true">↓</span></a>}
+        {item.type === 'text' ? <button disabled={item.decryptionError} onClick={copy}>{copied ? 'Copy again' : 'Copy text'} <span aria-hidden="true">⧉</span></button> : <a href={item.url} download={item.name}>Download <span aria-hidden="true">↓</span></a>}
         <button className="delete" disabled={busy} aria-label={`Delete ${item.type === 'text' ? 'text item' : item.name}`} onClick={async () => { try { await itemStore.remove(item.id); announce('Item deleted.'); } catch { /* Store displays request errors. */ } }}>Delete</button>
       </div>
     </article>

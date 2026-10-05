@@ -5,6 +5,12 @@ import test from 'node:test';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import ts from 'typescript';
+import { moduleUrl } from './load-ts.mjs';
+import { IDBFactory } from 'fake-indexeddb';
+const L = await import(await moduleUrl('src/localVault.ts'));
+const clientEnrollment = await L.createEnrollment();
+let clientVault = await L.unlockEnrollment(clientEnrollment);
+L.activateVault(clientVault);
 
 const accessKey = randomBytes(32).toString('hex');
 const verifier = createHash('sha256').update(accessKey).digest('hex');
@@ -12,7 +18,7 @@ const secret = randomBytes(32).toString('hex');
 const cookieName = '__Host-aegis-session';
 
 // Run the real Worker code against workerd's SQLite D1 and local R2 bindings.
-const modules = await Promise.all(['worker/index.ts', 'worker/storage.ts', 'worker/auth.ts', 'src/model.ts'].map(async path => ({
+const modules = await Promise.all(['worker/index.ts', 'worker/storage.ts', 'worker/auth.ts', 'src/model.ts', 'src/textEnvelope.ts', 'src/crypto/format.ts'].map(async path => ({
   type: 'ESModule', path: resolve(path.replace(/\.ts$/, '.js')),
   contents: ts.transpileModule(await readFile(path, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
@@ -80,6 +86,15 @@ test('Worker API with real local D1 and R2', async t => {
     await bucket.put(`items/${existingId}`, 'existing bytes');
     await db.prepare("INSERT INTO items (id,type,file_key,file_name,mime_type,size) VALUES (?, 'file', ?, 'existing.bin', 'application/octet-stream', 14)").bind(existingId, `items/${existingId}`).run();
     await migrate('migrations/0002_history_index.sql');
+    const oldTextId = crypto.randomUUID();
+    await db.prepare("INSERT INTO items (id,type,text_content,size) VALUES (?, 'text', 'discarded pre-E2EE plaintext', 28)").bind(oldTextId).run();
+    await migrate('migrations/0003_text_e2ee.sql');
+    await t.test('E2EE migration removes plaintext rows and column while preserving files', async () => {
+      assert.equal(await db.prepare('SELECT id FROM items WHERE id = ?').bind(oldTextId).first(), null);
+      const columns = (await db.prepare('PRAGMA table_info(items)').all()).results.map(row => row.name);
+      assert.ok(!columns.includes('text_content')); assert.ok(columns.includes('text_envelope'));
+      assert.ok(await db.prepare('SELECT id FROM items WHERE id = ?').bind(existingId).first());
+    });
     await t.test('history index upgrade preserves existing rows and uses an indexed cursor seek', async () => {
       assert.equal((await db.prepare('SELECT file_key FROM items WHERE id = ?').bind(existingId).first()).file_key, `items/${existingId}`);
       assert.equal(await (await bucket.get(`items/${existingId}`)).text(), 'existing bytes');
@@ -167,9 +182,16 @@ test('Worker API with real local D1 and R2', async t => {
       }
       assert.equal((await fetch('/api/auth/logout', { method: 'POST', headers: { 'Sec-Fetch-Site': 'same-site' } })).status, 403);
     });
-    const page = async (query = '') => { const response = await fetch(`/api/items${query}`); assert.equal(response.status, 200); return response.json(); };
+    const page = async (query = '') => { const response = await fetch(`/api/items${query}`); assert.equal(response.status, 200); const wire = await response.json();
+      // Client-side decrypt only: the Worker list never returns these plaintext fields.
+      return { ...wire, items: await Promise.all(wire.items.map(async item => item.type === 'text'
+        ? { ...item, text: await L.decryptVaultText(item.id, item.envelope) } : item)) }; };
     const list = async () => (await page()).items;
-    const text = value => fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: value }) });
+    const textIds = new Map();
+    const text = async value => {
+      const payload = await L.encryptVaultText(value); textIds.set(value, payload.id);
+      return fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    };
     const file = (name, body, headers = {}) => fetch('/api/items/file', { method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(name),
         'X-File-Size': String(Buffer.byteLength(body)), ...headers }, body });
@@ -187,7 +209,7 @@ test('Worker API with real local D1 and R2', async t => {
       await db.prepare('UPDATE items SET created_at = 0 WHERE id = ?').bind(old.id).run();
       for (let i = 1; i <= 7; i++) {
         assert.equal((await text(`text ${i}`)).status, 201);
-        await db.prepare('UPDATE items SET created_at = ? WHERE text_content = ?').bind(i, `text ${i}`).run();
+        await db.prepare('UPDATE items SET created_at = ? WHERE id = ?').bind(i, textIds.get(`text ${i}`)).run();
       }
       const first = await page();
       assert.deepEqual(first.items.map(item => item.text), ['text 7', 'text 6', 'text 5', 'text 4', 'text 3']);
@@ -232,7 +254,7 @@ test('Worker API with real local D1 and R2', async t => {
       await reset();
       for (let i = 1; i <= 10; i++) {
         await text(`history ${i}`);
-        await db.prepare('UPDATE items SET created_at = ? WHERE text_content = ?').bind(i, `history ${i}`).run();
+        await db.prepare('UPDATE items SET created_at = ? WHERE id = ?').bind(i, textIds.get(`history ${i}`)).run();
       }
       const first = await page();
       await text('new arrival');
@@ -335,7 +357,7 @@ test('Worker API with real local D1 and R2', async t => {
       assert.ok(!disposition.includes('\r') && !disposition.includes('\n'));
       assert.equal(decodeURIComponent(disposition.split("filename*=UTF-8''")[1]), name);
       assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/jsonp' }, body: '{"text":"wrong mime"}' })).status, 415);
-      assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'Application/JSON; charset=utf-8' }, body: '{"text":"valid mime"}' })).status, 201);
+      assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'Application/JSON; charset=utf-8' }, body: JSON.stringify(await L.encryptVaultText('valid mime')) })).status, 201);
       for (const [path, method, allow] of [['/api/items/file', 'GET', 'POST'], ['/api/items/text', 'DELETE', 'POST'], ['/api/items', 'POST', 'GET']]) {
         const denied = await fetch(path, { method });
         assert.equal(denied.status, 405); assert.equal(denied.headers.get('allow'), allow);
@@ -349,8 +371,9 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal((await file('bad.bin', '1', { 'X-File-Name': '%ZZ' })).status, 400);
       assert.equal((await file('bad.bin', '1', { 'X-File-Size': '-1' })).status, 400);
       assert.equal((await file('bad.bin', '1', { 'Content-Type': 'invalid' })).status, 400);
-      assert.equal((await text('  ')).status, 400);
-      assert.equal((await text('a'.repeat(65537))).status, 413);
+      assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: '  ' }) })).status, 400);
+      await assert.rejects(L.encryptVaultText('a'.repeat(65537)));
+      assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'x'.repeat(90001) })).status, 413);
       for (const body of ['{', '{}', '{"text":1}', '{"text":"hello","type":"file"}']) {
         assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })).status, 400);
       }
@@ -454,9 +477,90 @@ test('Worker API with real local D1 and R2', async t => {
       await reset();
       const response = await fetch('/api/items/text', { method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Test-Fail-Cleanup-Query': '1' },
-        body: JSON.stringify({ text: 'saved despite cleanup outage' }) });
+        body: JSON.stringify(await L.encryptVaultText('saved despite cleanup outage')) });
       assert.equal(response.status, 201);
       assert.equal((await list())[0].text, 'saved despite cleanup outage');
+    });
+    await t.test('encrypted text transport is ciphertext-only and rejects plaintext or substituted framing', async () => {
+      await reset();
+      const original = 'Secret text: ảnh Việt Nam 🌿\n二行目 — exact whitespace  ';
+      const payload = await L.encryptVaultText(original);
+      const post = data => fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+      assert.ok(!JSON.stringify(payload).includes(original));
+      assert.equal((await post(payload)).status, 201);
+      const wire = await (await fetch('/api/items')).json();
+      assert.equal(wire.items[0].text, undefined); assert.equal(wire.items[0].envelope, payload.envelope);
+      const row = await db.prepare('SELECT * FROM items WHERE id = ?').bind(payload.id).first();
+      assert.ok(!JSON.stringify(row).includes(original)); assert.equal(row.text_content, undefined);
+      assert.equal(await L.decryptVaultText(payload.id, row.text_envelope), original);
+      assert.equal((await post({ text: original })).status, 400);
+      assert.equal((await post({ ...payload, text: original })).status, 400);
+      assert.equal((await post({ ...payload, id: crypto.randomUUID() })).status, 400);
+      assert.equal((await post({ ...payload, envelope: payload.envelope + '=' })).status, 400);
+      assert.equal((await post({ ...payload, envelope: 'a'.repeat(87599) })).status, 400);
+      assert.equal((await post(payload)).status, 409);
+      const empty = await L.encryptVaultText(''); assert.equal((await post(empty)).status, 201);
+      assert.equal(await L.decryptVaultText(empty.id, empty.envelope), '');
+      const maximum = await L.encryptVaultText('x'.repeat(65536)); assert.equal((await post(maximum)).status, 201);
+    });
+    await t.test('actual app vault/API/store roundtrip, per-item damage, copy, pagination, lock/reload and delete', async () => {
+      await reset();
+      const previousFetch = globalThis.fetch, previousIDB = globalThis.indexedDB;
+      globalThis.indexedDB = new IDBFactory();
+      const { authStore } = await import(await moduleUrl('src/auth.ts'));
+      const { vaultStore } = await import(await moduleUrl('src/vaultStore.ts'));
+      const { itemStore } = await import(await moduleUrl('src/store.ts'));
+      const { localVaultStorage } = await import(await moduleUrl('src/localVaultStorage.ts'));
+      const { copyTextItem } = await import(await moduleUrl('src/textClipboard.ts'));
+      const settle = async () => { while (vaultStore.getSnapshot().busy) await new Promise(resolve => setTimeout(resolve, 1)); };
+      let hold, release, entered;
+      globalThis.fetch = async (path, options = {}) => {
+        if (path.startsWith('/api/items?') && hold) {
+          entered(); await new Promise(resolve => { release = resolve; });
+        }
+        return fetch(path, options);
+      };
+      try {
+        await authStore.check(); await settle(); await vaultStore.bootstrap();
+        assert.equal(vaultStore.getSnapshot().status, 'unlocked'); await itemStore.load();
+        const original = 'Actual app secret: Tiếng Việt 🌿\n漢字';
+        await itemStore.addText(original);
+        let item = itemStore.getSnapshot().items[0]; assert.equal(item.text, original);
+        let copied; await copyTextItem(item, { writeText: async text => { copied = text; } }); assert.equal(copied, original);
+        const raw = await (await fetch('/api/items')).json(); assert.ok(!JSON.stringify(raw).includes(original));
+        const saved = await localVaultStorage.read();
+        const foreign = await L.unlockEnrollment(await L.createEnrollment()); L.activateVault(foreign);
+        await assert.rejects(L.decryptVaultText(item.id, raw.items[0].envelope));
+        L.releaseVault(foreign);
+        L.activateVault(await L.unlockEnrollment(saved));
+        for (let i = 0; i < 6; i++) await itemStore.addText(`page ${i}`);
+        const newest = itemStore.getSnapshot().items[0];
+        const row = await db.prepare('SELECT text_envelope FROM items WHERE id = ?').bind(newest.id).first();
+        const changed = Buffer.from(row.text_envelope, 'base64url'); changed[changed.length - 1] ^= 1;
+        await db.prepare('UPDATE items SET text_envelope = ? WHERE id = ?').bind(changed.toString('base64url'), newest.id).run();
+        await itemStore.load();
+        const damaged = itemStore.getSnapshot().items.find(value => value.id === newest.id);
+        assert.equal(damaged.decryptionError, true); assert.equal(damaged.text, '');
+        await assert.rejects(copyTextItem(damaged, { writeText: async () => { throw new Error('must not copy damage'); } }), /could not be decrypted/);
+        assert.ok(itemStore.getSnapshot().items.some(value => !value.decryptionError));
+        await itemStore.loadOlder(); assert.equal(itemStore.getSnapshot().items.length, 7);
+        assert.equal(itemStore.getSnapshot().items.find(value => value.id === item.id).text, original);
+        vaultStore.lock(); assert.deepEqual(itemStore.getSnapshot().items, []); await settle();
+        await assert.rejects(L.encryptVaultText('must stay locked'), /Unlock your local vault/);
+        await assert.rejects(L.decryptVaultText(item.id, raw.items[0].envelope), /Unlock your local vault/);
+        await vaultStore.unlock(); await itemStore.load(); await itemStore.loadOlder();
+        assert.equal(itemStore.getSnapshot().items.find(value => value.id === item.id).text, original);
+        hold = true;
+        const started = new Promise(resolve => { entered = resolve; });
+        const pending = itemStore.load(); await started; vaultStore.lock(); release(); await pending; hold = false;
+        assert.deepEqual(itemStore.getSnapshot().items, []); await settle();
+        await vaultStore.unlock(); await itemStore.load();
+        await itemStore.remove(item.id); assert.equal(await db.prepare('SELECT id FROM items WHERE id = ?').bind(item.id).first(), null);
+        await itemStore.remove(newest.id); assert.ok(!itemStore.getSnapshot().items.some(value => value.id === newest.id));
+        assert.ok(!JSON.stringify((await db.prepare('SELECT * FROM items').all()).results).includes(original));
+      } finally {
+        vaultStore.setAuthenticated(false); globalThis.fetch = previousFetch; globalThis.indexedDB = previousIDB; clientVault = await L.unlockEnrollment(clientEnrollment); L.activateVault(clientVault);
+      }
     });
     await t.test('metadata deletion failure retains a retryable tombstone after R2 removal', async () => {
       await reset();

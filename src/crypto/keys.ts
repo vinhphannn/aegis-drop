@@ -4,16 +4,18 @@ export const randomBytes = (length: number) => crypto.getRandomValues(new Uint8A
 export const generateMaster = () => randomBytes(32);
 export function generateItemId() { const id = randomBytes(16); id[6] = (id[6] & 15) | 64; id[8] = (id[8] & 63) | 128; return id; }
 export function generateVault() { return { master: generateMaster(), vaultId: randomBytes(16), epochId: randomBytes(16) }; }
-export async function hkdf(secret: Uint8Array, salt: Uint8Array, info: Uint8Array, length: number) {
+export type VaultSecret = Uint8Array | CryptoKey;
+export async function hkdf(secret: VaultSecret, salt: Uint8Array, info: Uint8Array, length: number) {
   const saltSnapshot = new Uint8Array(salt), infoSnapshot = new Uint8Array(info);
-  const key = await crypto.subtle.importKey('raw', sized(secret, 32), 'HKDF', false, ['deriveBits']);
+  const key = secret instanceof Uint8Array ? await crypto.subtle.importKey('raw', sized(secret, 32), 'HKDF', false, ['deriveBits']) : secret;
+  requireValue(key.type === 'secret' && key.algorithm.name === 'HKDF' && !key.extractable && key.usages.includes('deriveBits'));
   return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: saltSnapshot, info: infoSnapshot }, key, length * 8));
 }
 export function vaultInfo(label: 'item-wrap' | 'item-manifest' | 'file-chunks' | 'vault-check', vaultId: Uint8Array, epochId: Uint8Array, itemId?: Uint8Array) {
   requireValue((label === 'vault-check') === (itemId === undefined));
   return tuple(encoder.encode('AEGIS-Drop'), uint(VERSION, 2), encoder.encode(label), sized(vaultId, 16), sized(epochId, 16), ...(itemId ? [sized(itemId, 16)] : []));
 }
-export async function aesKey(secret: Uint8Array, salt: Uint8Array, info: Uint8Array, usages: KeyUsage[]) {
+export async function aesKey(secret: VaultSecret, salt: Uint8Array, info: Uint8Array, usages: KeyUsage[]) {
   const raw = await hkdf(secret, salt, info, 32);
   try { return await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, usages); }
   finally { raw.fill(0); }

@@ -199,7 +199,7 @@ test('local browser vault enrollment', async t => {
       await authStore.check(); await settle(V.vaultStore); await V.vaultStore.bootstrap();
       assert.equal(state(V.vaultStore).status, 'unlocked'); const before = await S.localVaultStorage.read();
       globalThis.fetch = async path => path.startsWith('/api/items')
-        ? Response.json({ items: [{ id: 'legacy', type: 'text', text: 'legacy plaintext', createdAt: 1 }], nextCursor: null })
+        ? Response.json({ items: [{ ...(await L.encryptVaultText('cache test')), type: 'text', createdAt: 1 }], nextCursor: null })
         : Response.json({ authenticated: true });
       await itemStore.load(); assert.equal(itemStore.getSnapshot().items.length, 1);
       V.vaultStore.lock(); assert.deepEqual(itemStore.getSnapshot().items, []); await settle(V.vaultStore); await V.vaultStore.unlock();

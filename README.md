@@ -1,11 +1,12 @@
-# AEGIS Drop — Phase 3
+# AEGIS Drop — Phase 4B.1B
 
-A small React + TypeScript clipboard with a Cloudflare Worker API, D1 metadata,
-and private R2 file storage. One private persistent history protected by a single access key and
-a signed session cookie; no accounts, encryption, realtime, PWA, or pairing yet.
-Text and files are still plaintext to the server. Authentication does not encrypt
-content. Future client-side encryption must use an independent key.
+A small React + TypeScript clipboard with a Cloudflare Worker, D1 and private R2.
+Text is encrypted/decrypted in the browser with an independently generated local
+vault. The Worker and active D1 schema receive only text envelopes. Files still
+use the existing unencrypted path. Pairing, recovery UI, realtime and Google auth
+are not implemented. Keep this browser's local vault data to read its text again.
 
+See [Phase 4B.1B local run and smoke test](docs/phase4b1b-text-e2ee.md).
 ## Install and local development
 
 Use Node.js 22 or newer.
@@ -14,7 +15,7 @@ Use Node.js 22 or newer.
 npm install
 npm run build
 npm run db:migrate:local
-npm run dev:worker -- --https
+npm run dev:worker -- --local-protocol https
 ```
 
 Before starting, configure local authentication as described in
@@ -23,21 +24,28 @@ Wrangler uses **local** D1/R2 in `.wrangler/state`; this does not create cloud
 resources or require real account IDs. Restarting preserves that local data.
 `wrangler.jsonc` contains a placeholder D1 UUID suitable for local development.
 
-For frontend hot reload, leave the Worker running and use a second terminal:
+For frontend hot reload on `http://localhost:5173`, stop the HTTPS Worker first.
+Run the HTTP Worker and Vite in two terminals:
 
 ```sh
-npm run dev
+# Terminal 1 (backend, local D1/R2)
+npm run dev:worker -- --local-protocol http --ip 127.0.0.1 --port 8787
+# Terminal 2 (frontend)
+npm run dev -- --host localhost --port 5173 --strictPort
 ```
 
-Open the Vite URL (normally `http://localhost:5173`). Vite proxies `/api` to
-`127.0.0.1:8787` (HTTP Worker needed for this proxy). Secure-cookie behavior on
+Open `http://localhost:5173`. Vite proxies `/api` to the **HTTP** Worker at
+`127.0.0.1:8787`, translating only same-origin Origin headers to the backend origin.
+Do not run an HTTPS Worker behind this HTTP proxy. Secure-cookie behavior on
 HTTP localhost depends on browser support; the HTTPS Worker is the reference
 local authentication flow. Do not use Vite alone: it requires the Worker and migration.
 `npm run preview` previews the frontend build only; use Wrangler to preview the
 complete app. Rebuild the frontend before testing it directly on port 8787.
 
 On startup the app checks the session. Enter your access key once to unlock this
-device. **Lock device** clears its session cookie and displayed history.
+device. **Sign out** clears its session cookie and displayed history, retaining enrollment.
+Create/unlock the local vault to use the app; **Lock vault** clears active plaintext
+without signing out. Reload requires local vault unlock again.
 
 Type/paste text, click **Send text** or Ctrl/Cmd + Enter, paste an image into the
 text box, drop files on the composer, or use **Add files**. Enter adds a newline.
@@ -97,7 +105,7 @@ for the owner to execute and have not been run remotely here.
 | `GET /api/auth/session` | session cookie | `{ "authenticated": true or false }` |
 | `POST /api/auth/logout` | session cookie | clears cookie |
 | `GET /api/items?limit=5&cursor=...` | optional limit/cursor | `{ "items": [...], "nextCursor": "..." or null }` |
-| `POST /api/items/text` | JSON `{ "text": "..." }` | 201 `{ "ok": true }` |
+| `POST /api/items/text` | JSON `{ "id": "<client UUIDv4>", "envelope": "<canonical base64url>" }` | 201 `{ "ok": true }` |
 | `POST /api/items/file` | raw binary body + headers below | 201 `{ "ok": true }` |
 | `GET /api/items/:id/file` | none | streamed attachment |
 | `DELETE /api/items/:id` | none | `{ "ok": true }` |
@@ -123,8 +131,11 @@ when supplied, must agree with the declared size. Workers' `FixedLengthStream`
 also verifies actual bytes, including requests without Content-Length, and streams
 to R2 without buffering the entire file or base64 conversion. Zero-byte files
 are accepted. Text is limited to 64 KiB UTF-8; JSON request bodies are bounded too.
-The storage layer does not inspect binary contents and can later hold opaque
-ciphertext. Phase 4 will need to evolve client serialization and metadata.
+The server validates text envelope framing, version, inline kind and ID binding;
+it does not have the vault key or authenticate the encrypted manifest. The browser
+verifies that manifest before displaying/copying text. Corrupted/wrong-vault text
+shows a per-item failure card with Delete available. Text request JSON is bounded
+to 90,000 bytes to accommodate envelope/base64 overhead.
 
 R2 keys are generated UUIDs (`items/<uuid>`), never user filenames. Downloads
 preserve the original MIME and filename (including UTF-8 names) and always use
@@ -133,11 +144,14 @@ previewed by the UI. Raster image previews use the same download endpoint.
 
 ## Schema, history, and failure ordering
 
-The **items** table contains `id`, `type` (`text` or `file`), `text_content`,
+The active **items** table contains `id`, `type` (`text` or `file`), `text_envelope`,
 `file_key`, `file_name`, `mime_type`, `size`, `created_at`, and `pending_delete`.
 Checks enforce type-specific fields and nonnegative sizes. `created_at` comes
 from D1's clock. Ordering is `created_at DESC, id DESC`, including timestamp ties.
-Migration 0002 updates the index without changing existing rows or migration 0001.
+Migration 0003 rebuilds the table without the old plaintext column, discards
+pre-E2EE text rows, and preserves file rows. This is a pre-deployment local-dev reset,
+not an automatic encryption migration. Historical migration 0001 is not an active
+plaintext compatibility path. Text size records envelope bytes, not plaintext bytes.
 
 Text and files persist until explicitly deleted. Insertion performs one INSERT;
 there is no automatic retention, eviction, storage quota, or content indexing.

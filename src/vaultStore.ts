@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { authStore } from './auth';
 import { itemStore } from './store';
-import { createEnrollment, inspectEnrollment, releaseVault, unlockEnrollment } from './localVault';
+import { activateVault, clearActiveVault, createEnrollment, inspectEnrollment, releaseVault, unlockEnrollment } from './localVault';
 import type { UnlockedVault } from './localVault';
 import { localVaultStorage, VaultStorageError } from './localVaultStorage';
 import type { VaultStorage } from './localVaultStorage';
@@ -15,7 +15,7 @@ export function createVaultStore(storage: VaultStorage = localVaultStorage) {
   let authenticated = false, generation = 0, handle: UnlockedVault | undefined;
   const listeners = new Set<() => void>();
   function update(patch: Partial<VaultState>) { state = { ...state, ...patch }; listeners.forEach(listener => listener()); }
-  function discard() { if (handle) releaseVault(handle); handle = undefined; }
+  function discard() { clearActiveVault(); if (handle) releaseVault(handle); handle = undefined; }
   function failure(error: unknown) {
     const damaged = error instanceof VaultStorageError && error.kind === 'damaged';
     update({ status: damaged ? 'damaged' : 'unavailable', busy: false,
@@ -53,7 +53,7 @@ export function createVaultStore(storage: VaultStorage = localVaultStorage) {
         if (saved === null) throw new VaultStorageError('damaged');
         const opened = await unlockEnrollment(saved);
         if (epoch !== generation) { releaseVault(opened); return; }
-        handle = opened; update({ status: 'unlocked', busy: false });
+        handle = opened; activateVault(opened); update({ status: 'unlocked', busy: false });
       } catch (error) { if (epoch === generation) failure(error); }
     },
     async bootstrap() {
@@ -72,7 +72,7 @@ export function createVaultStore(storage: VaultStorage = localVaultStorage) {
         if (persisted === null) throw new VaultStorageError('damaged');
         const opened = await unlockEnrollment(persisted);
         if (epoch !== generation) { releaseVault(opened); return; }
-        handle = opened; update({ status: 'unlocked', busy: false });
+        handle = opened; activateVault(opened); update({ status: 'unlocked', busy: false });
       } catch (error) {
         if (epoch !== generation) return;
         if (error instanceof VaultStorageError && error.kind === 'exists') await check();

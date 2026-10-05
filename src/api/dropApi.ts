@@ -1,12 +1,14 @@
 import { authStore } from '../auth';
-import type { DropItem, ItemPage } from '../model';
+import type { DropItem, FileItem, ItemPage } from '../model';
 import { DEFAULT_PAGE_SIZE } from '../model';
+import { decryptVaultText, encryptVaultText } from '../localVault';
 
-function isItem(value: unknown): value is DropItem {
+type RemoteItem = FileItem | { id: string; type: 'text'; createdAt: number; envelope?: unknown };
+function isItem(value: unknown): value is RemoteItem {
   if (!value || typeof value !== 'object' || !('id' in value) || typeof value.id !== 'string' ||
     !('createdAt' in value) || typeof value.createdAt !== 'number' || !Number.isSafeInteger(value.createdAt) ||
     Math.abs(value.createdAt) > 8.64e15 || !('type' in value)) return false;
-  if (value.type === 'text') return 'text' in value && typeof value.text === 'string';
+  if (value.type === 'text') return true; // Validate/decrypt each envelope independently below.
   return value.type === 'file' && 'name' in value && typeof value.name === 'string' &&
     'size' in value && typeof value.size === 'number' && Number.isSafeInteger(value.size) && value.size >= 0 &&
     'mimeType' in value && typeof value.mimeType === 'string' &&
@@ -31,10 +33,17 @@ export const dropApi = {
     if (!data || typeof data !== 'object' || !('items' in data) || !Array.isArray(data.items) ||
       data.items.length > DEFAULT_PAGE_SIZE || !data.items.every(isItem) || !('nextCursor' in data) ||
       (data.nextCursor !== null && (typeof data.nextCursor !== 'string' || !data.nextCursor))) throw new Error('Invalid item list response.');
-    return { items: data.items, nextCursor: data.nextCursor as string | null };
+    const items: DropItem[] = await Promise.all(data.items.map(async value => {
+      if (value.type !== 'text') return value;
+      const base = { id: value.id, type: 'text' as const, createdAt: value.createdAt };
+      try { return { ...base, text: await decryptVaultText(value.id, value.envelope) }; }
+      catch { return { ...base, text: '', decryptionError: true }; }
+    }));
+    return { items, nextCursor: data.nextCursor as string | null };
   },
   async addText(text: string) {
-    await request('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    const payload = await encryptVaultText(text);
+    await request('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   },
   async addFile(file: File) {
     await request('/api/items/file', { method: 'POST', body: file, headers: {

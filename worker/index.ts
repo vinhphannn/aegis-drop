@@ -3,7 +3,7 @@ import { MAX_FILE_SIZE } from '../src/model';
 import { cleanup, insertItem, listItems, markDeleted, parsePage, UUID } from './storage';
 import type { Env, ItemRow } from './storage';
 
-const MAX_TEXT_BYTES = 64 * 1024;
+import { MAX_TEXT_REQUEST_BYTES, parseTextEnvelope } from '../src/textEnvelope';
 class ApiError extends Error {
   constructor(public status: number, message: string, public allow?: string) { super(message); }
 }
@@ -15,7 +15,7 @@ async function createText(request: Request, env: Env) {
   if (request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
     throw new ApiError(415, 'Send text as application/json.');
   }
-  // Bound even chunked JSON bodies before parsing. Text stays opaque to storage.
+  // Bound even chunked JSON before parsing; only public encrypted framing is validated.
   const reader = request.body?.getReader();
   if (!reader) throw new ApiError(400, 'Missing text body.');
   const chunks: Uint8Array[] = [];
@@ -24,7 +24,7 @@ async function createText(request: Request, env: Env) {
     const { value, done } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > MAX_TEXT_BYTES + 4096) {
+    if (size > MAX_TEXT_REQUEST_BYTES) {
       await reader.cancel();
       throw new ApiError(413, 'Text request is too large.');
     }
@@ -33,14 +33,17 @@ async function createText(request: Request, env: Env) {
   let payload: unknown;
   try { payload = JSON.parse(await new Blob(chunks).text()); }
   catch { throw new ApiError(400, 'Invalid JSON.'); }
-  if (!payload || typeof payload !== 'object' || !('text' in payload) || typeof payload.text !== 'string' || !payload.text.trim()) {
-    throw new ApiError(400, 'A non-empty text string is required.');
-  }
-  if ('type' in payload && payload.type !== 'text') throw new ApiError(400, 'Invalid item type.');
-  const bytes = new TextEncoder().encode(payload.text).byteLength;
-  if (bytes > MAX_TEXT_BYTES) throw new ApiError(413, 'Text is limited to 64 KiB.');
-  await insertItem(env, { id: crypto.randomUUID(), type: 'text', text_content: payload.text,
-    file_key: null, file_name: null, mime_type: null, size: bytes });
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+    Object.keys(payload).sort().join(',') !== 'envelope,id' ||
+    !('id' in payload) || typeof payload.id !== 'string' || !UUID.test(payload.id) ||
+    !('envelope' in payload)) throw new ApiError(400, 'An encrypted text envelope and client item ID are required.');
+  let bytes: Uint8Array;
+  try { bytes = parseTextEnvelope(payload.id, payload.envelope).bytes; }
+  catch { throw new ApiError(400, 'Invalid encrypted text envelope.'); }
+  const existing = await env.DB.prepare('SELECT id FROM items WHERE id = ?').bind(payload.id).first();
+  if (existing) throw new ApiError(409, 'Item ID already exists.');
+  await insertItem(env, { id: payload.id, type: 'text', text_envelope: payload.envelope as string,
+    file_key: null, file_name: null, mime_type: null, size: bytes.length });
 }
 
 async function createFile(request: Request, env: Env) {
@@ -94,7 +97,7 @@ async function createFile(request: Request, env: Env) {
         if (result.status === 'rejected') throw result.reason;
       }
     }
-    await insertItem(env, { id, type: 'file', text_content: null,
+    await insertItem(env, { id, type: 'file', text_envelope: null,
       file_key: key, file_name: name, mime_type: mimeType, size });
   } catch (error) {
     // A transport error is not proof of rollback: D1 may have committed before

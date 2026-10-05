@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { moduleUrl } from './load-ts.mjs';
 
+const L = await import(await moduleUrl('src/localVault.ts'));
+L.activateVault(await L.unlockEnrollment(await L.createEnrollment()));
 const { itemStore } = await import(await moduleUrl('src/store.ts'));
 
 test('remote store uses the API and authoritative lists, preserves text and handles failure', async () => {
@@ -26,8 +28,9 @@ test('remote store uses the API and authoritative lists, preserves text and hand
     if (failMutation) return Response.json({ error: 'Upload rejected' }, { status: 413 });
     if (path === '/api/items/text') {
       if (holdMutation) await new Promise(resolve => { releaseMutation = resolve; });
-      const { text } = JSON.parse(options.body);
-      serverItems = [{ id: 'text-id', type: 'text', text, createdAt: 1 }];
+      const { id, envelope } = JSON.parse(options.body);
+      assert.ok(!options.body.includes('preserve whitespace'));
+      serverItems = [{ id, type: 'text', envelope, createdAt: 1 }];
     } else if (path === '/api/items/file') {
       assert.ok(options.body instanceof File, 'send binary File without base64 or multipart');
       assert.equal(options.headers['X-File-Size'], String(options.body.size));
@@ -70,6 +73,7 @@ test('remote store uses the API and authoritative lists, preserves text and hand
     await assert.rejects(itemStore.addText('duplicate'), /Please wait/);
     await itemStore.load();
     assert.equal(calls.length, countWhileBusy, 'no overlapping reload or duplicate POST while busy');
+    while (!releaseMutation) await new Promise(resolve => setTimeout(resolve, 1));
     releaseMutation();
     await send;
     holdMutation = false;
@@ -97,7 +101,7 @@ test('remote store uses the API and authoritative lists, preserves text and hand
 
 test('history loads only on request, appends and deduplicates, retries failures and serializes requests', async () => {
   const originalFetch = globalThis.fetch;
-  const item = (id, createdAt) => ({ id, createdAt, type: 'text', text: id });
+  const item = (id, createdAt) => ({ id, createdAt, type: 'file', name: id, size: 0, mimeType: 'application/octet-stream', url: `/api/items/${id}/file` });
   const calls = [];
   let failOlder = false;
   let release;

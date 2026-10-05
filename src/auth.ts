@@ -10,11 +10,28 @@ function update(patch: Partial<AuthState>) {
   listeners.forEach(listener => listener());
 }
 async function request(path: string, options?: RequestInit) {
-  const response = await fetch(`/api/auth/${path}`, { ...options, credentials: 'same-origin', cache: 'no-store' });
-  const data = await response.json();
-  if (!response.ok) throw new Error(typeof data?.error === 'string' ? data.error : 'Authentication request failed.');
-  if (typeof data?.authenticated !== 'boolean') throw new Error('Invalid authentication response.');
-  return data.authenticated as boolean;
+  let response: Response, body: string;
+  try {
+    response = await fetch(`/api/auth/${path}`, { ...options, credentials: 'same-origin', cache: 'no-store' });
+    body = await response.text();
+  } catch { throw new Error('Cannot reach the authentication backend. Start npm run dev:worker and check its terminal.'); }
+  const type = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+  const http = `HTTP ${response.status}`;
+  if (response.status === 204 || !body.trim()) {
+    throw new Error(response.ok ? `Authentication server returned an empty response (${http}).` :
+      `Authentication backend unavailable (${http}, empty response). Start npm run dev:worker and check its terminal.`);
+  }
+  if (type !== 'application/json' && !type?.endsWith('+json')) {
+    const detail = !response.ok && type === 'text/plain' ? ` ${body.trim().slice(0, 200)}` : '';
+    throw new Error(`Authentication server returned ${http} with ${type || 'no content type'}; expected JSON.${detail} Check the backend terminal.`);
+  }
+  let data: unknown;
+  try { data = JSON.parse(body); }
+  catch { throw new Error(`Authentication server returned invalid JSON (${http}). Check the backend terminal.`); }
+  if (!response.ok) throw new Error(data && typeof data === 'object' && 'error' in data && typeof data.error === 'string'
+    ? data.error : `Authentication request failed (${http}).`);
+  if (!data || typeof data !== 'object' || !('authenticated' in data) || typeof data.authenticated !== 'boolean') throw new Error('Invalid authentication response.');
+  return data.authenticated;
 }
 const message = (error: unknown) => error instanceof Error ? error.message : 'Authentication request failed.';
 export const authStore = {

@@ -4,7 +4,7 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 import wrtc from '@roamhq/wrtc';
 import { moduleUrl } from './load-ts.mjs';
 globalThis.IDBKeyRange = IDBKeyRange;
-const { HistoryStore } = await import(await moduleUrl('src/history.ts'));
+const { HistoryStore, ITEM_TTL_MS } = await import(await moduleUrl('src/history.ts'));
 const { HistorySync } = await import(await moduleUrl('src/sync.ts'));
 const { DirectPeer, checksum } = await import(await moduleUrl('src/peer.ts'));
 const factory = new IDBFactory();
@@ -132,6 +132,57 @@ test('idle inventory messages do not repeatedly announce Synced', async () => {
     const item = await a.createText('one new sync cycle');
     await until(async () => !!(await b.get(item.id)));
     await until(() => pair.feedbackB.filter(value => value === 'Synced').length === 2);
+    assert.deepEqual(pair.errors, []);
+  } finally { for (const close of cleanup.splice(0).reverse()) await close(); }
+});
+
+
+test('24-hour expiry deletes metadata and blobs, preserves newer items and blocks resurrection', async () => {
+  try {
+    const name = crypto.randomUUID(); let now = Date.now();
+    let store = new HistoryStore(name, factory, () => now); await store.ready;
+    cleanup.push(() => store.close());
+    const text = await store.createText('expires after 24 hours');
+    const file = await store.createFile(new File(['original file'], 'expires.bin'));
+    now += ITEM_TTL_MS - 1;
+    assert.ok(await store.get(text.id)); assert.ok(await store.blob(file.id));
+    const fresh = await store.createText('still fresh');
+    now += 1;
+    assert.equal(await store.get(text.id), undefined);
+    assert.equal((await store.inventoryPage()).some(item => item.id === file.id), false);
+    await assert.rejects(store.blob(file.id), /expired/);
+    await store.cleanup();
+    assert.deepEqual(store.getSnapshot().map(item => item.id), [fresh.id]);
+    const db = await new Promise((resolve, reject) => { const open = factory.open(name); open.onsuccess = () => resolve(open.result); open.onerror = () => reject(open.error); });
+    for (const [table, id] of [['items', text.id], ['items', file.id], ['blobs', file.id]]) {
+      const result = await new Promise((resolve, reject) => { const get = db.transaction(table).objectStore(table).get(id); get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });
+      assert.equal(result, undefined);
+    }
+    db.close();
+    assert.equal(await store.put(text), false);
+    assert.equal(await store.put(file, new Blob(['original file'])), false);
+    assert.equal(await count(store), 1);
+    await store.close(); now += ITEM_TTL_MS;
+    store = new HistoryStore(name, factory, () => now); await store.ready; cleanup.push(() => store.close());
+    assert.equal(await count(store), 0); assert.equal(store.getSnapshot().length, 0);
+  } finally { for (const close of cleanup.splice(0).reverse()) await close(); }
+});
+
+test('sync ignores expired inventories and does not persist expired text or binary from stale peers', async () => {
+  try {
+    const oldClock = Date.now() - ITEM_TTL_MS - 1;
+    const stale = new HistoryStore(crypto.randomUUID(), factory, () => oldClock); await stale.ready; cleanup.push(() => stale.close());
+    const fresh = await history();
+    const text = await stale.createText('old peer history');
+    const file = await stale.createFile(new File(['old bytes'], 'expired-sync.bin'));
+    const pair = await connect(stale, fresh);
+    await until(() => pair.feedbackB.includes('Synced'));
+    assert.equal(await count(fresh), 0);
+    assert.equal(pair.a.getSnapshot().transfers.length, 0);
+    pair.a.sendText(text.text, text.id, text);
+    await pair.a.sendFile(new File(['old bytes'], file.name, { type: file.mimeType }), file.id, file);
+    assert.equal(await count(fresh), 0);
+    await assert.rejects(fresh.blob(file.id), /expired|unavailable/);
     assert.deepEqual(pair.errors, []);
   } finally { for (const close of cleanup.splice(0).reverse()) await close(); }
 });

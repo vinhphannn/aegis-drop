@@ -43,7 +43,7 @@ export class HistorySync {
 class SyncPeer {
   private stopped = false;
   private missing: string[] = [];
-  private remoteIds = new Set<string>();
+  private remoteIds = new Map<string, number>();
   private requested?: string;
   private timer?: ReturnType<typeof setTimeout>;
   private outgoing: string[] = [];
@@ -92,7 +92,7 @@ class SyncPeer {
   }
 
   announce(item: InventoryItem) {
-    if (this.stopped || this.store.getSnapshot().status !== 'connected') return;
+    if (this.stopped || this.store.getSnapshot().status !== 'connected' || this.manager.history.isExpired(item.createdAt)) return;
     try { this.store.sendHistory({ type: 'inventory', items: [{ id: item.id, createdAt: item.createdAt, type: item.type, ...(item.type === 'file' ? { size: item.size, hash: item.hash } : {}) }] }); }
     catch (error) { this.report(error); }
   }
@@ -102,7 +102,8 @@ class SyncPeer {
       if (!Array.isArray(message.items) || message.items.length > 48) throw new Error('Invalid history inventory.');
       for (const item of message.items) {
         if (!item || !uuid.test(item.id) || !Number.isSafeInteger(item.createdAt) || !['text', 'file'].includes(item.type)) throw new Error('Invalid history inventory.');
-        this.remoteIds.add(item.id);
+        if (this.manager.history.isExpired(item.createdAt)) continue;
+        this.remoteIds.set(item.id, item.createdAt);
         if (!(await this.manager.history.get(item.id)) && !this.manager.reservations.has(item.id)) {
           this.manager.reservations.set(item.id, this); this.missing.push(item.id);
         }
@@ -116,13 +117,14 @@ class SyncPeer {
       void this.sendNext().catch(error => this.report(error));
     } else if (message.type === 'item-unavailable') {
       if (typeof message.id !== 'string' || message.id !== this.requested) throw new Error('Invalid history response.');
-      this.manager.error('Requested history item unavailable.');
+      if (!this.manager.history.isExpired(this.remoteIds.get(message.id) ?? 0)) this.manager.error('Requested history item unavailable.');
       this.manager.reservations.delete(message.id); this.received(message.id);
     }
   }
   async reconsider() {
     if (this.stopped) return;
-    for (const id of this.remoteIds) {
+    for (const [id, createdAt] of this.remoteIds) {
+      if (this.manager.history.isExpired(createdAt)) { this.remoteIds.delete(id); continue; }
       if (!(await this.manager.history.get(id)) && !this.manager.reservations.has(id)) {
         this.manager.reservations.set(id, this); this.missing.push(id);
       }
@@ -133,6 +135,7 @@ class SyncPeer {
     if (this.stopped || this.requested) return;
     while (this.missing.length) {
       const id = this.missing.shift()!;
+      if (this.manager.history.isExpired(this.remoteIds.get(id) ?? 0)) { this.manager.reservations.delete(id); this.remoteIds.delete(id); continue; }
       const existing = await this.manager.history.get(id);
       if (this.stopped) return;
       if (existing) { this.manager.reservations.delete(id); continue; }

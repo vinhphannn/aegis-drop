@@ -5,6 +5,8 @@ export type HistoryItem = { id: string; createdAt: number; senderDeviceId: strin
   { type: 'file'; name: string; mimeType: string; size: number; hash: string }
 );
 export type InventoryItem = Pick<HistoryItem, 'id' | 'createdAt' | 'type'> & { size?: number; hash?: string };
+export const ITEM_TTL_MS = 24 * 60 * 60 * 1000;
+export function isExpired(createdAt: number, now = Date.now()) { return createdAt <= now - ITEM_TTL_MS; }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export function validateItem(item: HistoryItem) {
   if (!item || !uuid.test(item.id) || !uuid.test(item.senderDeviceId) || !Number.isSafeInteger(item.createdAt) || item.createdAt < 0) throw new Error('Invalid item metadata.');
@@ -35,7 +37,7 @@ export class HistoryStore {
   private added = new Set<(item: HistoryItem) => void>();
   deviceId = '';
   readonly ready: Promise<void>;
-  constructor(name = 'aegis-drop-history', factory: IDBFactory = indexedDB) {
+  constructor(name = 'aegis-drop-history', factory: IDBFactory = indexedDB, private readonly now = () => Date.now()) {
     this.ready = this.open(name, factory);
   }
   private async open(name: string, factory: IDBFactory) {
@@ -52,8 +54,20 @@ export class HistoryStore {
     const result = await request(store.get('deviceId'));
     this.deviceId = result ?? crypto.randomUUID();
     if (!result) store.put(this.deviceId, 'deviceId');
-    await done; await this.refresh();
+    await done; await this.prune(); await this.refresh();
   }
+  isExpired(createdAt: number) { return isExpired(createdAt, this.now()); }
+  private async prune() {
+    const tx = this.db.transaction(['items', 'blobs'], 'readwrite'), done = complete(tx);
+    const cursor = tx.objectStore('items').index('recent').openCursor(IDBKeyRange.upperBound([this.now() - ITEM_TTL_MS, '\uffff']));
+    cursor.onsuccess = () => {
+      if (!cursor.result) return;
+      const id = cursor.result.value.id;
+      tx.objectStore('blobs').delete(id); cursor.result.delete(); cursor.result.continue();
+    };
+    await done;
+  }
+  async cleanup() { await this.ready; await this.prune(); await this.refresh(); }
   subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
   onAdded(fn: (item: HistoryItem) => void) { this.added.add(fn); return () => { this.added.delete(fn); }; }
   getSnapshot = () => this.recent;
@@ -64,14 +78,15 @@ export class HistoryStore {
       cursor.onerror = () => reject(new Error('Could not load local history.'));
       cursor.onsuccess = () => {
         if (!cursor.result || items.length === 50) { resolve(); return; }
-        items.push(cursor.result.value); cursor.result.continue();
+        if (!this.isExpired(cursor.result.value.createdAt)) items.push(cursor.result.value); cursor.result.continue();
       };
     });
     this.recent = items; this.listeners.forEach(fn => fn());
   }
-  async get(id: string): Promise<HistoryItem | undefined> { await this.ready; return request(this.db.transaction('items').objectStore('items').get(id)); }
+  async get(id: string): Promise<HistoryItem | undefined> { await this.ready; const item: HistoryItem | undefined = await request(this.db.transaction('items').objectStore('items').get(id)); return item && !this.isExpired(item.createdAt) ? item : undefined; }
   async blob(id: string): Promise<Blob> {
     await this.ready;
+    if (!(await this.get(id))) throw new Error('File expired or unavailable.');
     const blob = await request(this.db.transaction('blobs').objectStore('blobs').get(id));
     if (!(blob instanceof Blob)) throw new Error('Stored file unavailable.');
     return blob;
@@ -85,13 +100,14 @@ export class HistoryStore {
       cursor.onsuccess = () => {
         if (!cursor.result || items.length === 48) { resolve(); return; }
         const item: HistoryItem = cursor.result.value;
-        items.push({ id: item.id, createdAt: item.createdAt, type: item.type, ...(item.type === 'file' ? { size: item.size, hash: item.hash } : {}) }); cursor.result.continue();
+        if (!this.isExpired(item.createdAt)) items.push({ id: item.id, createdAt: item.createdAt, type: item.type, ...(item.type === 'file' ? { size: item.size, hash: item.hash } : {}) }); cursor.result.continue();
       };
     });
     return items;
   }
   async put(item: HistoryItem, blob?: Blob) {
     await this.ready; validateItem(item);
+    if (this.isExpired(item.createdAt)) return false;
     if (item.type === 'file' && (!blob || blob.size !== item.size)) throw new Error('Stored file size mismatch.');
     const tx = this.db.transaction(['items', 'blobs'], 'readwrite'), done = complete(tx);
     const store = tx.objectStore('items');
@@ -104,12 +120,12 @@ export class HistoryStore {
   }
   async createText(text: string) {
     await this.ready;
-    const item: HistoryItem = { id: crypto.randomUUID(), createdAt: Date.now(), senderDeviceId: this.deviceId, type: 'text', text };
+    const item: HistoryItem = { id: crypto.randomUUID(), createdAt: this.now(), senderDeviceId: this.deviceId, type: 'text', text };
     await this.put(item); return item;
   }
   async createFile(file: File) {
     await this.ready; validateSendFile(file);
-    const item: HistoryItem = { id: crypto.randomUUID(), createdAt: Date.now(), senderDeviceId: this.deviceId, type: 'file', name: file.name || 'screenshot.png', mimeType: file.type || 'application/octet-stream', size: file.size, hash: await checksum(file) };
+    const item: HistoryItem = { id: crypto.randomUUID(), createdAt: this.now(), senderDeviceId: this.deviceId, type: 'file', name: file.name || 'screenshot.png', mimeType: file.type || 'application/octet-stream', size: file.size, hash: await checksum(file) };
     await this.put(item, file); return item;
   }
   async close() { await this.ready; this.db.close(); }

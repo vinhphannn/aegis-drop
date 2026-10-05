@@ -145,9 +145,15 @@ export default function App() {
       if (alive && result) setMessage(result);
     };
     const timer = setInterval(() => { void check(); }, 30000);
-    const resume = () => { void check(); void history.ready.then(() => history.refresh()).catch(() => { if (alive) setMessage('Could not load local history.'); }); };
+    const resume = () => { void check(); void history.cleanup().catch(() => { if (alive) setMessage('Could not load local history.'); }); };
     window.addEventListener('focus', resume); document.addEventListener('visibilitychange', resume);
     return () => { alive = false; clearInterval(timer); window.removeEventListener('focus', resume); document.removeEventListener('visibilitychange', resume); };
+  }, []);
+  useEffect(() => {
+    let alive = true;
+    const clean = () => { void history.cleanup().catch(() => { if (alive) setMessage('Could not clean expired history.'); }); };
+    const timer = setInterval(clean, 60000);
+    return () => { alive = false; clearInterval(timer); };
   }, []);
   useEffect(() => {
     if (!panel) return;
@@ -171,7 +177,7 @@ export default function App() {
     if (!previous || (previous.phase !== 'failed' && (transfer.phase === 'failed' || !['sent', 'received'].includes(transfer.phase)))) grouped.set(transfer.id, transfer);
   }
   const visibleIds = new Set(items.map(item => item.id));
-  const recent = [...items, ...[...grouped.values()].filter(transfer => !visibleIds.has(transfer.id) && !['sent', 'received'].includes(transfer.phase))].sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+  const recent = [...items, ...[...grouped.values()].filter(transfer => !visibleIds.has(transfer.id) && !['sent', 'received'].includes(transfer.phase))].filter(item => !history.isExpired(item.createdAt)).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
   useEffect(() => {
     if (!syncStatus) return;
     if (syncStatus === 'Synced') { const timer = setTimeout(() => setSyncStatus(''), 2000); return () => clearTimeout(timer); }

@@ -75,6 +75,8 @@ export class DirectPeer {
     this.update({ status: 'disconnected', error: null, items: this.localDevice ? this.state.items : [], sending: null, receiving: null });
   };
   private fail(error: unknown) { const message = error instanceof Error ? error.message : 'Connection failed.'; this.disconnect(); this.update({ status: 'failed', error: message }); }
+  onPeers?: (peers: string[]) => void;
+  sendPeers(peers: string[]) { this.ready(); this.control({ type: 'peers', peers }); }
   setStatus(status: PeerState['status'], error: string | null = null) { this.update({ status, error }); }
   connect(connection: import('peerjs').DataConnection, session: string) {
     if (this.channel) { connection.close(); return; }
@@ -120,6 +122,10 @@ export class DirectPeer {
       this.hello = true; this.update({ status: 'connected', error: null, device: value.device }); return;
     }
     check(this.hello);
+    if (value.type === 'peers') {
+      check(Array.isArray(value.peers) && value.peers.length <= 64 && value.peers.every((id: unknown) => typeof id === 'string' && id.length <= 128));
+      this.onPeers?.(value.peers); return;
+    }
     if (value.type === 'text') {
       check(typeof value.id === 'string' && uuid.test(value.id) && typeof value.text === 'string' && encoder.encode(value.text).length <= MAX_TEXT_BYTES);
       if (!this.seen.has(value.id)) this.add({ id: value.id, createdAt: Date.now(), type: 'text', text: value.text }); return;

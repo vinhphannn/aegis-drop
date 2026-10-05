@@ -538,18 +538,11 @@ footer {
   font-size: 12px;
 }
 
-.unlock-shell { max-width: 560px; }
-.unlock-form { display: grid; gap: 16px; }
-.unlock-form label { font-size: 13px; color: #adbba5; }
-.unlock-form input {
-  width: 100%; min-width: 0; min-height: 48px; padding: 12px;
-  font: inherit; color: #eef2ea; background: #101311;
-  border: 1px solid #394337; border-radius: 8px;
-}
-.unlock-form input:focus-visible { outline: 2px solid #bce7a1; outline-offset: 2px; }
-.logout { border: 0; background: none; color: #94a18e; font: inherit; min-height: 44px; padding: 0 4px; }
+.logout { border:0; background:none; color:#94a18e; font:inherit; min-height:44px; padding:0 4px; }
 
-.vault-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 0; }
-.vault-toolbar strong { font-size: 13px; color: #bed8ab; }
-.vault-toolbar p, .vault-note { font-size: 12px; line-height: 1.6; color: #929c94; margin: 8px 0; }
-.vault-toolbar button { flex-shrink: 0; }
+.connection-actions { display:flex; gap:20px; flex-wrap:wrap; align-items:center; }
+.signal-form { display:grid; gap:12px; margin-top:20px; }
+.signal-form label { font-size:13px; color:#adbba5; }
+.signal-form textarea { border:1px solid #394337; border-radius:8px; font-size:12px; min-height:100px; padding:10px; overflow-wrap:anywhere; }
+.pairing-note { color:#929c94; font-size:12px; line-height:1.6; margin:20px 0 0; }
+.transfer-progress { color:#bed8ab; font-size:13px; overflow-wrap:anywhere; }

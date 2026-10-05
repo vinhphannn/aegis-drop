@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import Peer from 'peerjs';
 import type { DataConnection } from 'peerjs';
 import QRCode from 'qrcode';
-import { DirectPeer } from './peer';
-import type { ReceivedItem } from './peer';
+import { DirectPeer, validateSendFile } from './peer';
+import type { ReceivedItem, FileTransfer } from './peer';
 
 const ROOT_URL = 'https://vinhphannn.github.io/aegis-drop/';
 const HOST_ID = 'aegis-drop-vinhphannn-personal-v1';
@@ -21,6 +21,8 @@ export default function App() {
   const [panel, setPanel] = useState<'share' | 'devices' | null>(null);
   const [dragging, setDragging] = useState(false), [sending, setSending] = useState(false);
   const [, refresh] = useState(0);
+  const [localFailures, setLocalFailures] = useState<FileTransfer[]>([]);
+  const fileBusy = useRef(false);
   const connections = useRef(new Map<string, DirectPeer>());
   const picker = useRef<HTMLInputElement>(null), panelRoot = useRef<HTMLDivElement>(null);
   const local = useRef({ id: crypto.randomUUID(), label: deviceLabel() });
@@ -57,6 +59,7 @@ export default function App() {
         if (previous !== status) {
           previous = status;
           if (status === 'connected') { setMessage(''); broadcastPeers(); }
+          else if (store.getSnapshot().error) setMessage(store.getSnapshot().error!);
         }
       }));
       connection.on('close', () => {
@@ -103,20 +106,48 @@ export default function App() {
     document.addEventListener('pointerdown', close); document.addEventListener('keydown', escape);
     return () => { document.removeEventListener('pointerdown', close); document.removeEventListener('keydown', escape); };
   }, [panel]);
+  useEffect(() => {
+    const input = picker.current;
+    const cancelled = () => setMessage('No file selected.');
+    input?.addEventListener('cancel', cancelled);
+    return () => input?.removeEventListener('cancel', cancelled);
+  }, []);
   const stores = [...connections.current.entries()];
   const connected = stores.filter(([, store]) => store.getSnapshot().status === 'connected');
   const items = [...new Map(stores.flatMap(([, store]) => store.getSnapshot().items).map(item => [item.id, item])).values()].sort((a, b) => b.createdAt - a.createdAt);
+  const grouped = new Map<string, FileTransfer>();
+  for (const transfer of [...localFailures, ...stores.flatMap(([, store]) => store.getSnapshot().transfers)]) {
+    const previous = grouped.get(transfer.id);
+    if (!previous || (previous.phase !== 'failed' && (transfer.phase === 'failed' || !['sent', 'received'].includes(transfer.phase)))) grouped.set(transfer.id, transfer);
+  }
+  const recent = [...items.filter(item => item.type === 'text'), ...[...grouped.values()].filter(transfer => !['sent', 'received'].includes(transfer.phase) || items.some(item => item.id === transfer.id))].sort((a, b) => b.createdAt - a.createdAt);
   function recipients() {
     if (!connected.length) { setMessage('No connected devices.'); return []; }
     setMessage(''); return connected.map(([, store]) => store);
   }
+  function fileFailure(file: File, reason: string) {
+    setMessage(reason);
+    setLocalFailures(items => [{ id: crypto.randomUUID(), name: file.name || 'screenshot.png', size: file.size, createdAt: Date.now(), direction: 'send', phase: 'failed', bytes: 0, error: reason }, ...items]);
+  }
   async function files(list: File[]) {
-    if (sending || !list.length) return;
-    const peers = recipients(); if (!peers.length) return;
-    setSending(true);
-    try { for (const file of list) { const id = crypto.randomUUID(); await Promise.all(peers.map(store => store.sendFile(file, id))); } }
-    catch (error) { setMessage(error instanceof Error ? error.message : 'Transfer failed.'); }
-    finally { setSending(false); }
+    if (!list.length) { setMessage('No file selected.'); return; }
+    const valid: File[] = [];
+    for (const file of list) {
+      try { validateSendFile(file); valid.push(file); }
+      catch (error) { fileFailure(file, error instanceof Error ? error.message : 'Invalid file.'); }
+    }
+    if (!valid.length) return; // Every rejected file already has a visible failed card.
+    if (fileBusy.current) { valid.forEach(file => fileFailure(file, 'Another file is sending.')); return; }
+    const peers = [...connections.current.values()].filter(store => store.getSnapshot().status === 'connected');
+    if (!peers.length) { valid.forEach(file => fileFailure(file, 'No connected devices.')); return; }
+    fileBusy.current = true; setSending(true);
+    try { for (const file of valid) {
+      const id = crypto.randomUUID();
+      const results = await Promise.allSettled(peers.map(store => store.sendFile(file, id)));
+      for (const result of results) if (result.status === 'rejected') setMessage(result.reason instanceof Error ? result.reason.message : 'Transfer failed.');
+    }
+    } catch (error) { valid.forEach(file => fileFailure(file, error instanceof Error ? error.message : 'Transfer failed.')); }
+    finally { fileBusy.current = false; setSending(false); }
   }
   function send() {
     if (sending || !text.trim()) return;
@@ -147,14 +178,30 @@ export default function App() {
     </div></header>
     <div className={`composer ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); void files(Array.from(event.dataTransfer.files)); }}>
       <textarea aria-label="Message" placeholder="Paste text, image or drop a file..." value={text} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} onPaste={event => { const list = Array.from(event.clipboardData.files); if (list.length) { event.preventDefault(); void files(list); } }} />
-      <button className="attach" aria-label="Choose files" disabled={sending} onClick={() => picker.current?.click()}>+</button>
-      <input hidden ref={picker} type="file" multiple onChange={event => { void files(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
+      <button className="attach" aria-label="Choose files" onClick={() => {
+        try { if (!picker.current) throw new Error(); picker.current.click(); }
+        catch { setMessage('Could not open file picker.'); }
+      }}>+</button>
+      <input hidden ref={picker} type="file" multiple onChange={event => {
+        try { void files(Array.from(event.target.files ?? [])); }
+        catch { setMessage('Could not read file selection.'); }
+        finally { event.target.value = ''; }
+      }} />
     </div>
-    {stores.flatMap(([id, store]) => [store.getSnapshot().sending, store.getSnapshot().receiving].map((progress, index) => progress && <p className="progress" key={`${id}-${index}`}>{progress.name} · {progress.total ? Math.round(progress.bytes / progress.total * 100) : 100}%</p>))}
-    <section className="items">{items.map(item => <article key={item.id}>{item.type === 'text' ? <><pre>{item.text}</pre><button onClick={() => { void navigator.clipboard.writeText(item.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></> : <>
-      {item.previewUrl && <img className="preview" src={item.previewUrl} alt={item.name} />}
-      <p>{item.name} <small>{size(item.size)}</small></p><div className="item-actions">{item.previewUrl && typeof ClipboardItem !== 'undefined' && typeof navigator.clipboard?.write === 'function' && <button onClick={() => { void copyImage(item); }}>Copy image</button>}<a href={item.url} download={item.name}>Save</a></div>
-    </>}</article>)}</section>
+    <section className="items">{recent.map(entry => {
+      if ('text' in entry) return <article key={entry.id}><pre>{entry.text}</pre><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></article>;
+      const item = items.find(item => item.id === entry.id && item.type === 'file');
+      const completed = entry.phase === 'sent' || entry.phase === 'received';
+      const percent = entry.size ? Math.floor(entry.bytes / entry.size * 100) : completed || entry.phase === 'verifying' ? 100 : 0;
+      const label = entry.phase === 'failed' ? `Failed — ${entry.error}` : completed ? `${entry.phase === 'sent' ? 'Sent' : 'Received'} ✓ · Verified ✓` : entry.phase === 'sending' || entry.phase === 'receiving' ? `${entry.phase === 'sending' ? 'Sending' : 'Receiving'} ${percent}%` : `${entry.phase === 'hashing' ? 'Hashing' : entry.phase === 'verifying' ? 'Verifying' : 'Preparing'}…`;
+      return <article key={entry.id}>
+        {completed && item?.type === 'file' && item.previewUrl && <img className="preview" src={item.previewUrl} alt={entry.name} />}
+        <p>{entry.name} <small>{size(entry.size)}</small></p>
+        <p className={entry.phase === 'failed' ? 'error' : 'progress'} role="status">{label}</p>
+        {(entry.phase === 'sending' || entry.phase === 'receiving') && <progress aria-label={`${entry.name} transfer progress`} value={entry.bytes} max={entry.size || 1} />}
+        {completed && item?.type === 'file' && <div className="item-actions">{item.previewUrl && typeof ClipboardItem !== 'undefined' && typeof navigator.clipboard?.write === 'function' && <button onClick={() => { void copyImage(item); }}>Copy image</button>}<a href={item.url} download={item.name}>Save</a></div>}
+      </article>;
+    })}</section>
     {message && <p role="status" className="error">{message}</p>}
   </main>;
 }

@@ -534,3 +534,14 @@ footer {
   color: #94a18e;
   font-size: 12px;
 }
+
+.unlock-shell { max-width: 560px; }
+.unlock-form { display: grid; gap: 16px; }
+.unlock-form label { font-size: 13px; color: #adbba5; }
+.unlock-form input {
+  width: 100%; min-width: 0; min-height: 48px; padding: 12px;
+  font: inherit; color: #eef2ea; background: #101311;
+  border: 1px solid #394337; border-radius: 8px;
+}
+.unlock-form input:focus-visible { outline: 2px solid #bce7a1; outline-offset: 2px; }
+.logout { border: 0; background: none; color: #94a18e; font: inherit; min-height: 44px; padding: 0 4px; }

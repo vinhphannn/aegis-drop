@@ -1,3 +1,4 @@
+import { authStore, useAuth } from './auth';
 import { useEffect, useRef, useState } from 'react';
 import type { ClipboardEvent, DragEvent, FormEvent } from 'react';
 import { itemStore, MAX_FILE_SIZE, useItems } from './store';
@@ -43,7 +44,8 @@ function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message
 
 export default function App() {
   const { items, nextCursor, loading, loadingOlder, busy, error } = useItems();
-  const unavailable = loading || loadingOlder || busy;
+  const auth = useAuth();
+  const unavailable = loading || loadingOlder || busy || auth.busy;
   useEffect(() => { void itemStore.load(); }, []);
   const [text, setText] = useState('');
   const [message, setMessage] = useState('');
@@ -93,8 +95,8 @@ export default function App() {
         {loading ? <p className="loading">Loading drops…</p> : items.length ? <div className="items">{items.map(item => <ItemCard key={item.id} item={item} announce={setMessage} busy={unavailable} />)}</div> : <div className="empty"><span aria-hidden="true">↘</span><h3>Room for your next thought.</h3><p>Send some text or add a file to get started.</p></div>}
         {nextCursor && <button className="load-older" disabled={unavailable} onClick={() => { void itemStore.loadOlder(); }}>{loadingOlder ? 'Loading older…' : 'Load older'}</button>}
       </section>
-      <p className="status" role="status" aria-live="polite">{error || (busy ? 'Saving…' : message)}</p>
-      <footer><span>Kept until you delete it.</span><span>Stored in the cloud · Refresh to sync</span></footer>
+      <p className="status" role="status" aria-live="polite">{auth.error || error || (busy ? 'Saving…' : message)}</p>
+      <footer><span>Kept until you delete it.</span><span>Stored in the cloud · <button className="logout" disabled={unavailable} onClick={() => { void authStore.logout(); }}>Lock device</button></span></footer>
     </main>
   );
 }

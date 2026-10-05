@@ -1,3 +1,4 @@
+import { authStore } from '../auth';
 import type { DropItem, ItemPage } from '../model';
 import { DEFAULT_PAGE_SIZE } from '../model';
 
@@ -13,8 +14,10 @@ function isItem(value: unknown): value is DropItem {
 }
 
 async function request(path: string, options?: RequestInit) {
-  const response = await fetch(path, { ...options, cache: 'no-store' });
+  const epoch = authStore.getGeneration();
+  const response = await fetch(path, { ...options, credentials: 'same-origin', cache: 'no-store' });
   if (!response.ok) {
+    if (response.status === 401) authStore.expire(epoch);
     const data = await response.json().catch(() => null) as { error?: string } | null;
     throw new Error(data?.error || `Request failed (${response.status}).`);
   }

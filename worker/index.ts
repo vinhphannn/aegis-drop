@@ -1,3 +1,4 @@
+import { authenticated, authRoute, AuthError, checkOrigin } from './auth';
 import { MAX_FILE_SIZE } from '../src/model';
 import { cleanup, insertItem, listItems, markDeleted, parsePage, UUID } from './storage';
 import type { Env, ItemRow } from './storage';
@@ -129,6 +130,10 @@ export default {
     const path = new URL(request.url).pathname;
     if (!path.startsWith('/api/')) return env.ASSETS.fetch(request);
     try {
+      checkOrigin(request);
+      const authResponse = await authRoute(request, env);
+      if (authResponse) return authResponse;
+      if (!await authenticated(request, env)) throw new ApiError(401, 'Authentication required.');
       if (path === '/api/items' && request.method === 'GET') {
         const page = parsePage(new URL(request.url).searchParams);
         if (!page) throw new ApiError(400, 'Invalid pagination limit or cursor.');
@@ -156,7 +161,7 @@ export default {
       }
       throw new ApiError(404, 'Endpoint not found.');
     } catch (error) {
-      if (error instanceof ApiError) return json({ error: error.message }, error.status, error.allow ? { Allow: error.allow } : {});
+      if (error instanceof ApiError || error instanceof AuthError) return json({ error: error.message }, error.status, error.allow ? { Allow: error.allow } : {});
       console.error('API operation failed');
       return json({ error: 'Storage operation failed. Please retry.' }, 500);
     }

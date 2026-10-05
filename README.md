@@ -1,10 +1,10 @@
-# AEGIS Drop — Phase 2
+# AEGIS Drop — Phase 3
 
 A small React + TypeScript clipboard with a Cloudflare Worker API, D1 metadata,
-and private R2 file storage. One shared persistent history; no accounts, authentication,
-encryption, realtime, PWA, or pairing yet. Text and files are currently plaintext.
-Anyone able to access a deployed API can read, upload, and delete items. Keep
-Phase 2 local until you deliberately choose to expose it; don't use it for secrets.
+and private R2 file storage. One private persistent history protected by a single access key and
+a signed session cookie; no accounts, encryption, realtime, PWA, or pairing yet.
+Text and files are still plaintext to the server. Authentication does not encrypt
+content. Future client-side encryption must use an independent key.
 
 ## Install and local development
 
@@ -14,10 +14,11 @@ Use Node.js 22 or newer.
 npm install
 npm run build
 npm run db:migrate:local
-npm run dev:worker
+npm run dev:worker -- --https
 ```
 
-Open `http://localhost:8787` for the built frontend and Worker on the same origin.
+Before starting, configure local authentication as described in
+[Phase 3 authentication](docs/phase3-auth.md). Open `https://localhost:8787` for the built frontend and Worker on the same origin.
 Wrangler uses **local** D1/R2 in `.wrangler/state`; this does not create cloud
 resources or require real account IDs. Restarting preserves that local data.
 `wrangler.jsonc` contains a placeholder D1 UUID suitable for local development.
@@ -29,9 +30,14 @@ npm run dev
 ```
 
 Open the Vite URL (normally `http://localhost:5173`). Vite proxies `/api` to
-`127.0.0.1:8787`. Do not use Vite alone: it requires the Worker and migration.
+`127.0.0.1:8787` (HTTP Worker needed for this proxy). Secure-cookie behavior on
+HTTP localhost depends on browser support; the HTTPS Worker is the reference
+local authentication flow. Do not use Vite alone: it requires the Worker and migration.
 `npm run preview` previews the frontend build only; use Wrangler to preview the
 complete app. Rebuild the frontend before testing it directly on port 8787.
+
+On startup the app checks the session. Enter your access key once to unlock this
+device. **Lock device** clears its session cookie and displayed history.
 
 Type/paste text, click **Send text** or Ctrl/Cmd + Enter, paste an image into the
 text box, drop files on the composer, or use **Add files**. Enter adds a newline.
@@ -67,8 +73,9 @@ npm run deploy
 ```
 
 `npm run deploy` builds the frontend and deploys the Worker with static assets.
-Only `/api/*` is routed through the Worker first. Every deployed visitor shares
-this one list. These commands change real account resources; they are documented
+Only `/api/*` is routed through the Worker first. Every authenticated device shares
+this one list. Configure the two authentication secrets and login rate limiting
+before deployment; see [Phase 3 authentication](docs/phase3-auth.md). These commands change real account resources; they are documented
 for the owner to execute and have not been run remotely here.
 
 ## Files and API
@@ -78,17 +85,27 @@ for the owner to execute and have not been run remotely here.
 - `src/store.ts`: server-list cache, loading/busy/error state, mutation + refresh.
 - `worker/index.ts`: routing, validation, streaming upload and attachment download.
 - `worker/storage.ts`: D1 keyset pagination, insertion, explicit-delete cleanup retries.
+- `worker/auth.ts`: access-key verification, signed cookies, origin checks.
+- `src/auth.ts` / `src/AuthGate.tsx`: session state and minimal unlock screen.
 - `migrations/0001_items.sql`: the single items table.
 - `migrations/0002_history_index.sql`: indexed timestamp/ID history ordering.
 - `wrangler.jsonc`: Worker, static assets, D1/R2 binding configuration.
 
 | Endpoint | Request | Success |
 | --- | --- | --- |
+| `POST /api/auth/login` | JSON `{ "accessKey": "..." }` | sets session cookie |
+| `GET /api/auth/session` | session cookie | `{ "authenticated": true or false }` |
+| `POST /api/auth/logout` | session cookie | clears cookie |
 | `GET /api/items?limit=5&cursor=...` | optional limit/cursor | `{ "items": [...], "nextCursor": "..." or null }` |
 | `POST /api/items/text` | JSON `{ "text": "..." }` | 201 `{ "ok": true }` |
 | `POST /api/items/file` | raw binary body + headers below | 201 `{ "ok": true }` |
 | `GET /api/items/:id/file` | none | streamed attachment |
 | `DELETE /api/items/:id` | none | `{ "ok": true }` |
+
+All item/list/upload/download/delete routes require a valid cookie; otherwise
+they return 401 before accessing D1 or R2. Authentication responses are no-store.
+Non-GET mutations reject foreign Origin and cross-site/same-site Fetch Metadata.
+No cross-origin API access or CORS preflight support is configured.
 
 Errors return `{ "error": "..." }` with a 4xx/5xx status. Missing items return
 404; invalid IDs/payloads return 400; unsupported text content types return 415;
@@ -189,3 +206,6 @@ The [Phase 2 audit](docs/phase2-audit.md) records reproduced failures, fixes,
 test coverage, and unresolved architectural limitations. Local 100 MiB acceptance
 is not proof of account/edge acceptance or Free-plan CPU/heap compliance; see
 [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
+
+Phase 3 configuration, security assumptions, session limitations, and deployment
+requirements are documented in [phase3-auth.md](docs/phase3-auth.md).

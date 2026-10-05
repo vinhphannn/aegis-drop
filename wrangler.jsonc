@@ -3,6 +3,7 @@
   "name": "aegis-drop",
   "main": "worker/index.ts",
   "compatibility_date": "2026-10-05",
+  "secrets": { "required": ["ACCESS_KEY_SHA256", "SESSION_SECRET"] },
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",

@@ -2,7 +2,7 @@ import type { ItemPage } from '../src/model';
 import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '../src/model';
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-export interface Env { DB: D1Database; FILES: R2Bucket; ASSETS: Fetcher }
+export interface Env { DB: D1Database; FILES: R2Bucket; ASSETS: Fetcher; ACCESS_KEY_SHA256: string; SESSION_SECRET: string }
 export interface ItemRow {
   id: string; type: 'text' | 'file'; text_content: string | null;
   file_key: string | null; file_name: string | null; mime_type: string | null;

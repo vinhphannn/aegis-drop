@@ -2,12 +2,17 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import test from 'node:test';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import ts from 'typescript';
 
+const accessKey = randomBytes(32).toString('hex');
+const verifier = createHash('sha256').update(accessKey).digest('hex');
+const secret = randomBytes(32).toString('hex');
+const cookieName = '__Host-aegis-session';
+
 // Run the real Worker code against workerd's SQLite D1 and local R2 bindings.
-const modules = await Promise.all(['worker/index.ts', 'worker/storage.ts', 'src/model.ts'].map(async path => ({
+const modules = await Promise.all(['worker/index.ts', 'worker/storage.ts', 'worker/auth.ts', 'src/model.ts'].map(async path => ({
   type: 'ESModule', path: resolve(path.replace(/\.ts$/, '.js')),
   contents: ts.transpileModule(await readFile(path, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
@@ -50,6 +55,9 @@ export default {
         ? async () => { throw new Error('injected R2 deletion failure'); }
         : bucket.delete.bind(bucket)
     }};
+    if (request.headers.get('x-test-missing-auth')) env.SESSION_SECRET = undefined;
+    if (request.headers.get('x-test-rotate-secret')) env.SESSION_SECRET = 'f'.repeat(64);
+    if (request.headers.get('x-test-rotate-verifier')) env.ACCESS_KEY_SHA256 = 'f'.repeat(64);
     return worker.fetch(request, env);
   }
 };` });
@@ -57,7 +65,7 @@ export default {
 test('Worker API with real local D1 and R2', async t => {
   const mf = new Miniflare(convertV4MiniflareOptions({
     modules, compatibilityDate: '2026-10-05', d1Databases: { DB: 'test-db' },
-    r2Buckets: { FILES: 'test-files' }, bindings: {},
+    r2Buckets: { FILES: 'test-files' }, bindings: { ACCESS_KEY_SHA256: verifier, SESSION_SECRET: secret },
   }));
   try {
     const db = await mf.getD1Database('DB');
@@ -79,7 +87,86 @@ test('Worker API with real local D1 and R2', async t => {
       assert.ok(plan.some(row => row.detail.includes('items_recent')));
       assert.ok(!plan.some(row => row.detail.includes('TEMP B-TREE')), 'no whole-history sort for an older page');
     });
-    const fetch = (path, options) => mf.dispatchFetch(`http://localhost${path}`, options);
+    const rawFetch = (path, options) => mf.dispatchFetch(`https://localhost${path}`, options);
+    let sessionCookie;
+    const fetch = (path, options = {}) => rawFetch(path, { ...options, headers: { cookie: sessionCookie, ...options.headers } });
+    const login = (key, extra = {}) => rawFetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json', ...extra }, body: JSON.stringify({ accessKey: key }) });
+    await t.test('login verifies the key, sets a private secure session without credential disclosure', async () => {
+      const wrong = await login('incorrect-key');
+      assert.equal(wrong.status, 401); assert.equal(wrong.headers.get('set-cookie'), null);
+      const correct = await login(accessKey);
+      assert.equal(correct.status, 200); assert.equal(correct.headers.get('cache-control'), 'no-store');
+      const header = correct.headers.get('set-cookie');
+      for (const attribute of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/', 'Max-Age=2592000']) assert.ok(header.includes(attribute));
+      assert.ok(!header.includes('Domain='));
+      sessionCookie = header.split(';')[0];
+      assert.ok(!sessionCookie.includes(accessKey)); assert.ok(!sessionCookie.includes(verifier));
+      assert.ok(!sessionCookie.includes(secret));
+      assert.deepEqual(await correct.json(), { authenticated: true });
+      const status = await fetch('/api/auth/session');
+      assert.deepEqual(await status.json(), { authenticated: true });
+      assert.equal(status.headers.get('cache-control'), 'no-store');
+      assert.equal((await fetch('/api/items')).status, 200);
+    });
+    await t.test('malformed and oversized login requests fail without setting cookies', async () => {
+      for (const body of ['{', '{}', 'null', '{"accessKey":1}', '{"accessKey":""}']) {
+        const response = await rawFetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        assert.equal(response.status, 400); assert.equal(response.headers.get('set-cookie'), null);
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+      }
+      assert.equal((await rawFetch('/api/auth/login', { method: 'POST', body: 'key' })).status, 415);
+      assert.equal((await rawFetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'a'.repeat(8193) })).status, 413);
+      for (const [route, method, allow] of [['login', 'GET', 'POST'], ['session', 'POST', 'GET'], ['logout', 'GET', 'POST']]) {
+        const response = await rawFetch(`/api/auth/${route}`, { method });
+        assert.equal(response.status, 405); assert.equal(response.headers.get('allow'), allow);
+      }
+    });
+    await t.test('every item route rejects missing authentication before touching storage', async () => {
+      for (const [path, method] of [['/api/items', 'GET'], ['/api/items/text', 'POST'], ['/api/items/file', 'POST'], [`/api/items/${existingId}/file`, 'GET'], [`/api/items/${existingId}`, 'DELETE']]) {
+        const response = await rawFetch(path, { method });
+        assert.equal(response.status, 401); assert.equal(response.headers.get('cache-control'), 'no-store');
+      }
+      assert.ok(await bucket.head(`items/${existingId}`));
+      assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM items').first()).n, 1);
+      assert.deepEqual(await (await rawFetch('/api/auth/session')).json(), { authenticated: false });
+    });
+    await t.test('forged, expired, future and malformed cookies are rejected; rotation invalidates sessions', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const signed = (issued, expires) => {
+        const payload = `v1.${issued}.${expires}.${'a'.repeat(32)}`;
+        return `${cookieName}=${payload}.${createHmac('sha256', Buffer.from(secret, 'hex')).update(`aegis-session:${verifier}:${payload}`).digest('hex')}`;
+      };
+      const valid = signed(now, now + 2592000);
+      assert.deepEqual(await (await rawFetch('/api/auth/session', { headers: { cookie: valid } })).json(), { authenticated: true });
+      const token = sessionCookie.slice(cookieName.length + 1);
+      const forged = `${cookieName}=${token.slice(0, -1)}${token.endsWith('0') ? '1' : '0'}`;
+      for (const cookie of ['garbage', `${cookieName}=`, `${cookieName}=bad`, `${cookieName}=%FF`, `${cookieName}=${'a'.repeat(257)}`, `${sessionCookie}; ${sessionCookie}`, forged,
+        signed(now - 2592001, now - 1), signed(now + 10, now + 2592010), signed(now, now + 1)]) {
+        const response = await rawFetch('/api/items', { headers: { cookie } });
+        assert.equal(response.status, 401, 'invalid cookie');
+      }
+      for (const flag of ['X-Test-Rotate-Secret', 'X-Test-Rotate-Verifier']) {
+        assert.equal((await fetch('/api/items', { headers: { [flag]: '1' } })).status, 401);
+      }
+      assert.equal((await fetch('/api/items', { headers: { 'X-Test-Missing-Auth': '1' } })).status, 503);
+      assert.equal((await login(accessKey, { 'X-Test-Missing-Auth': '1' })).status, 503);
+    });
+    await t.test('logout clears the host-only cookie and cross-origin mutations are rejected', async () => {
+      const logout = await fetch('/api/auth/logout', { method: 'POST', headers: { Origin: 'https://localhost' } });
+      assert.equal(logout.status, 200); assert.equal(logout.headers.get('cache-control'), 'no-store');
+      assert.ok(logout.headers.get('set-cookie').includes(`${cookieName}=;`));
+      assert.ok(logout.headers.get('set-cookie').includes('Max-Age=0'));
+      assert.deepEqual(await logout.json(), { authenticated: false });
+      const clearedCookie = logout.headers.get('set-cookie').split(';')[0];
+      assert.equal((await rawFetch('/api/items', { headers: { cookie: clearedCookie } })).status, 401);
+      // Stateless logout cannot revoke a copied old token; documented explicitly.
+      assert.equal((await fetch('/api/items')).status, 200);
+      for (const path of ['/api/auth/login', '/api/auth/logout', '/api/items/text', `/api/items/${existingId}`]) {
+        const response = await fetch(path, { method: path.endsWith(existingId) ? 'DELETE' : 'POST', headers: { Origin: 'https://other.example' } });
+        assert.equal(response.status, 403); assert.equal(response.headers.get('access-control-allow-origin'), null);
+      }
+      assert.equal((await fetch('/api/auth/logout', { method: 'POST', headers: { 'Sec-Fetch-Site': 'same-site' } })).status, 403);
+    });
     const page = async (query = '') => { const response = await fetch(`/api/items${query}`); assert.equal(response.status, 200); return response.json(); };
     const list = async () => (await page()).items;
     const text = value => fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: value }) });

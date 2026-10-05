@@ -1,13 +1,18 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import Peer from 'peerjs';
 import type { DataConnection } from 'peerjs';
 import QRCode from 'qrcode';
 import { checkVersion } from './version';
 import { DirectPeer, validateSendFile } from './peer';
-import type { ReceivedItem, FileTransfer } from './peer';
+import type { FileTransfer } from './peer';
+import { HistoryStore } from './history';
+import { HistorySync } from './sync';
+import FileCard from './FileCard';
+
+const history = new HistoryStore();
 
 const ROOT_URL = 'https://vinhphannn.github.io/aegis-drop/';
-const HOST_ID = 'aegis-drop-vinhphannn-personal-protocol-2';
+const HOST_ID = 'aegis-drop-vinhphannn-personal-protocol-3';
 
 function deviceLabel() {
   const ua = navigator.userAgent;
@@ -15,10 +20,12 @@ function deviceLabel() {
   const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
   return `${device} ${browser}`;
 }
-function size(bytes: number) { return bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
+
 
 export default function App() {
   const [qr, setQr] = useState(''), [link, setLink] = useState(''), [text, setText] = useState(''), [message, setMessage] = useState('');
+  const items = useSyncExternalStore(history.subscribe, history.getSnapshot);
+  const [syncStatus, setSyncStatus] = useState('');
   const [panel, setPanel] = useState<'share' | 'devices' | null>(null);
   const [dragging, setDragging] = useState(false), [sending, setSending] = useState(false);
   const [, refresh] = useState(0);
@@ -27,10 +34,11 @@ export default function App() {
   const disconnectActions = useRef(new Map<string, () => void>());
   const connections = useRef(new Map<string, DirectPeer>());
   const picker = useRef<HTMLInputElement>(null), panelRoot = useRef<HTMLDivElement>(null);
-  const local = useRef({ id: crypto.randomUUID(), label: deviceLabel() });
+  const local = useRef<{ id: string; label: string }>({ id: crypto.randomUUID(), label: deviceLabel() });
   useEffect(() => {
     let alive = true;
     const stores = connections.current;
+    const sync = new HistorySync(history, value => { if (alive) setSyncStatus(value); }, value => { if (alive) setMessage(value); });
     const unsubscribers: (() => void)[] = [];
     const options = { config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } };
     let peer: Peer;
@@ -50,6 +58,7 @@ export default function App() {
     const accept = (connection: DataConnection) => {
       if (livePeers.has(connection.peer)) { connection.close(); return; }
       const store = new DirectPeer(local.current);
+      sync.attach(store);
       store.onVersionMismatch = () => { void checkVersion(fileBusy.current).then(message => { if (alive && message) setMessage(message); }); };
       livePeers.set(connection.peer, { connection, store });
       stores.set(connection.connectionId, store);
@@ -74,6 +83,7 @@ export default function App() {
         }
       }));
       connection.on('close', () => {
+        sync.detach(store);
         clearTimeout(timeout); pendingTimers.delete(timeout);
         if (livePeers.get(connection.peer)?.connection === connection) {
           livePeers.delete(connection.peer);
@@ -99,22 +109,26 @@ export default function App() {
         } else setMessage('Connection unavailable.');
       });
     };
-    peer = new Peer(HOST_ID, options); setup(peer);
+    void history.ready.then(() => {
+      if (!alive) return;
+      local.current.id = history.deviceId;
+      peer = new Peer(HOST_ID, options); setup(peer);
+    }).catch(() => { if (alive) setMessage('Local history unavailable. Check browser storage.'); });
     const retry = setInterval(() => {
-      if (!alive || peer.destroyed) return;
+      if (!alive || !peer || peer.destroyed) return;
       if (peer.disconnected) { peer.reconnect(); return; }
       if (!isHost && peer.open) connectTo(HOST_ID);
     }, 3000);
     setLink(ROOT_URL);
     QRCode.toDataURL(ROOT_URL, { width: 240, margin: 2 }).then(value => { if (alive) setQr(value); }).catch(() => { if (alive) setMessage('Share unavailable.'); });
     return () => {
-      alive = false; clearInterval(retry); pendingTimers.forEach(clearTimeout); disconnectActions.current.clear(); unsubscribers.forEach(off => off());
+      alive = false; sync.dispose(); clearInterval(retry); pendingTimers.forEach(clearTimeout); disconnectActions.current.clear(); unsubscribers.forEach(off => off());
       for (const store of stores.values()) {
         const items = store.getSnapshot().items;
         store.disconnect();
         for (const item of items) if (item.type === 'file') { URL.revokeObjectURL(item.url); if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); }
       }
-      stores.clear(); peer.destroy();
+      stores.clear(); peer?.destroy();
     };
   }, []);
   useEffect(() => {
@@ -128,7 +142,7 @@ export default function App() {
       if (alive && result) setMessage(result);
     };
     const timer = setInterval(() => { void check(); }, 30000);
-    const resume = () => { void check(); };
+    const resume = () => { void check(); void history.ready.then(() => history.refresh()).catch(() => { if (alive) setMessage('Could not load local history.'); }); };
     window.addEventListener('focus', resume); document.addEventListener('visibilitychange', resume);
     return () => { alive = false; clearInterval(timer); window.removeEventListener('focus', resume); document.removeEventListener('visibilitychange', resume); };
   }, []);
@@ -147,20 +161,21 @@ export default function App() {
   }, []);
   const stores = [...connections.current.entries()];
   const connected = stores.filter(([, store]) => store.getSnapshot().status === 'connected');
-  const items = [...new Map(stores.flatMap(([, store]) => store.getSnapshot().items).map(item => [item.id, item])).values()].sort((a, b) => b.createdAt - a.createdAt);
+
   const grouped = new Map<string, FileTransfer>();
   for (const transfer of [...localFailures, ...stores.flatMap(([, store]) => store.getSnapshot().transfers)]) {
     const previous = grouped.get(transfer.id);
     if (!previous || (previous.phase !== 'failed' && (transfer.phase === 'failed' || !['sent', 'received'].includes(transfer.phase)))) grouped.set(transfer.id, transfer);
   }
-  const recent = [...items.filter(item => item.type === 'text'), ...[...grouped.values()].filter(transfer => !['sent', 'received'].includes(transfer.phase) || items.some(item => item.id === transfer.id))].sort((a, b) => b.createdAt - a.createdAt);
-  function recipients() {
-    if (!connected.length) { setMessage('No connected devices.'); return []; }
-    setMessage(''); return connected.map(([, store]) => store);
-  }
+  const visibleIds = new Set(items.map(item => item.id));
+  const recent = [...items, ...[...grouped.values()].filter(transfer => !visibleIds.has(transfer.id) && !['sent', 'received'].includes(transfer.phase))].sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+  useEffect(() => {
+    if (!syncStatus) return;
+    if (syncStatus === 'Synced') { const timer = setTimeout(() => setSyncStatus(''), 2000); return () => clearTimeout(timer); }
+  }, [syncStatus]);
   function fileFailure(file: File, reason: string) {
     setMessage(reason);
-    setLocalFailures(items => [{ id: crypto.randomUUID(), name: file.name || 'screenshot.png', size: file.size, createdAt: Date.now(), direction: 'send', phase: 'failed', bytes: 0, error: reason }, ...items]);
+    setLocalFailures(items => [{ id: crypto.randomUUID(), name: file.name || 'screenshot.png', size: file.size, createdAt: Date.now(), direction: 'send', phase: 'failed', bytes: 0, error: reason }, ...items.slice(0, 49)]);
   }
   async function files(list: File[]) {
     if (!list.length) { setMessage('No file selected.'); return; }
@@ -171,36 +186,18 @@ export default function App() {
     }
     if (!valid.length) return; // Every rejected file already has a visible failed card.
     if (fileBusy.current) { valid.forEach(file => fileFailure(file, 'Another file is sending.')); return; }
-    const peers = [...connections.current.values()].filter(store => store.getSnapshot().status === 'connected');
-    if (!peers.length) { valid.forEach(file => fileFailure(file, 'No connected devices.')); return; }
-    fileBusy.current = true; setSending(true);
+    fileBusy.current = true; setSending(true); setMessage('');
     try { for (const file of valid) {
       const id = crypto.randomUUID();
-      const results = await Promise.allSettled(peers.map(store => store.sendFile(file, id)));
-      for (const result of results) if (result.status === 'rejected') setMessage(result.reason instanceof Error ? result.reason.message : 'Transfer failed.');
-    }
-    } catch (error) { valid.forEach(file => fileFailure(file, error instanceof Error ? error.message : 'Transfer failed.')); }
-    finally { fileBusy.current = false; setSending(false); }
+      setLocalFailures(items => [{ id, name: file.name || 'screenshot.png', size: file.size, createdAt: Date.now(), direction: 'send', phase: 'hashing', bytes: 0 }, ...items.slice(0, 49)]);
+      try { await history.createFile(file); setLocalFailures(items => items.filter(item => item.id !== id)); }
+      catch (error) { setLocalFailures(items => items.filter(item => item.id !== id)); fileFailure(file, error instanceof Error ? error.message : 'Could not save file.'); }
+    } } finally { fileBusy.current = false; setSending(false); }
   }
-  function send() {
+  async function send() {
     if (sending || !text.trim()) return;
-    const peers = recipients(); if (!peers.length) return;
-    try { const id = crypto.randomUUID(); peers.forEach(store => store.sendText(text, id)); setText(''); }
-    catch (error) { setMessage(error instanceof Error ? error.message : 'Transfer failed.'); }
-  }
-  async function copyImage(item: ReceivedItem) {
-    if (item.type !== 'file' || !item.previewUrl) return;
-    try {
-      const source = item.previewUrl;
-      const png = (async () => {
-      const image = new Image(); image.src = source; await image.decode();
-      const canvas = document.createElement('canvas'); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
-      canvas.getContext('2d')!.drawImage(image, 0, 0);
-      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error()), 'image/png'));
-      return blob;
-      })();
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
-    } catch { setMessage('Copy image unavailable.'); }
+    try { await history.createText(text); setText(''); setMessage(''); }
+    catch (error) { setMessage(error instanceof Error ? error.message : 'Could not save text.'); }
   }
   return <main className="shell">
     <header><span className="brand">AEGIS DROP</span><div className="header-actions" ref={panelRoot}>
@@ -210,7 +207,7 @@ export default function App() {
       {panel === 'devices' && <div className="popover devices" role="dialog" aria-label="Connected devices"><h2>Connected devices</h2><div className="device"><span>● {local.current.label} <small>(This device)</small></span></div>{connected.map(([id, store]) => <div className="device" key={id}><span>● {store.getSnapshot().device?.label ?? 'Browser'}</span><button onClick={() => disconnectActions.current.get(id)?.()}>Disconnect</button></div>)}</div>}
     </div></header>
     <div className={`composer ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); void files(Array.from(event.dataTransfer.files)); }}>
-      <textarea aria-label="Message" placeholder="Paste text, image or drop a file..." value={text} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} onPaste={event => { const list = Array.from(event.clipboardData.files); if (list.length) { event.preventDefault(); void files(list); } }} />
+      <textarea aria-label="Message" placeholder="Paste text, image or drop a file..." value={text} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} onPaste={event => { const list = Array.from(event.clipboardData.files); if (list.length) { event.preventDefault(); void files(list); } }} />
       <button className="attach" aria-label="Choose files" onClick={() => {
         try { if (!picker.current) throw new Error(); picker.current.click(); }
         catch { setMessage('Could not open file picker.'); }
@@ -221,19 +218,12 @@ export default function App() {
         finally { event.target.value = ''; }
       }} />
     </div>
+    {syncStatus && <p className="progress" role="status">{syncStatus}</p>}
     <section className="items">{recent.map(entry => {
-      if ('text' in entry) return <article key={entry.id}><pre>{entry.text}</pre><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></article>;
-      const item = items.find(item => item.id === entry.id && item.type === 'file');
-      const completed = entry.phase === 'sent' || entry.phase === 'received';
-      const percent = entry.size ? Math.floor(entry.bytes / entry.size * 100) : completed || entry.phase === 'verifying' ? 100 : 0;
-      const label = entry.phase === 'failed' ? `Failed — ${entry.error}` : completed ? `${entry.phase === 'sent' ? 'Sent' : 'Received'} ✓ · Verified ✓` : entry.phase === 'sending' || entry.phase === 'receiving' ? `${entry.phase === 'sending' ? 'Sending' : 'Receiving'} ${percent}%` : `${entry.phase === 'hashing' ? 'Hashing' : entry.phase === 'verifying' ? 'Verifying' : 'Preparing'}…`;
-      return <article key={entry.id}>
-        {completed && item?.type === 'file' && item.previewUrl && <img className="preview" src={item.previewUrl} alt={entry.name} />}
-        <p>{entry.name} <small>{size(entry.size)}</small></p>
-        <p className={entry.phase === 'failed' ? 'error' : 'progress'} role="status">{label}</p>
-        {(entry.phase === 'sending' || entry.phase === 'receiving') && <progress aria-label={`${entry.name} transfer progress`} value={entry.bytes} max={entry.size || 1} />}
-        {completed && item?.type === 'file' && <div className="item-actions">{item.previewUrl && typeof ClipboardItem !== 'undefined' && typeof navigator.clipboard?.write === 'function' && <button onClick={() => { void copyImage(item); }}>Copy image</button>}<a href={item.url} download={item.name}>Save</a></div>}
-      </article>;
+      if ('type' in entry && entry.type === 'text') return <article key={entry.id}><pre>{entry.text}</pre><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></article>;
+      const item = 'type' in entry && entry.type === 'file' ? entry : undefined;
+      const transfer = grouped.get(entry.id);
+      return <FileCard key={entry.id} item={item} transfer={transfer ?? (!('type' in entry) ? entry : undefined)} history={history} error={setMessage} />;
     })}</section>
     {message && <p role="status" className="error">{message}</p>}
   </main>;

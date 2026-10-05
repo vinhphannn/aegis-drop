@@ -1,3 +1,4 @@
+import type { HistoryItem } from './history';
 import { APP_VERSION } from './version';
 export const CHUNK_BYTES = 16 * 1024;
 export const MAX_FILE_BYTES = 32 * 1024 * 1024;
@@ -23,7 +24,7 @@ export function validateSendFile(file: File) {
   }
   validFile(file.name || 'screenshot.png', file.type || 'application/octet-stream', file.size);
 }
-async function checksum(blob: Blob) {
+export async function checksum(blob: Blob) {
   try {
     const hash = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
     return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -36,13 +37,13 @@ export interface PeerState {
   transfers: readonly FileTransfer[];
   items: readonly ReceivedItem[]; sending: Progress | null; receiving: Progress | null;
 }
-interface Incoming { id: string; name: string; mime: string; size: number; hash: string; received: number; chunks: Uint8Array[] }
+interface Incoming { id: string; name: string; mime: string; size: number; hash: string; item?: HistoryItem; received: number; chunks: Uint8Array[] }
 export function validFile(name: unknown, mime: unknown, size: unknown) {
   check(typeof name === 'string' && name.length > 0 && encoder.encode(name).length <= 4096 && !/[\x00-\x1f\x7f/\\]/.test(name), 'Invalid filename.');
   check(typeof mime === 'string' && mime.length <= 255 && /^[\x20-\x7e]+$/.test(mime), 'Invalid file type.');
   check(typeof size === 'number' && Number.isSafeInteger(size) && size >= 0 && size <= MAX_FILE_BYTES, 'Files are limited to 32 MiB each.');
 }
-async function preview(blob: Blob, mime: string) {
+export async function preview(blob: Blob, mime: string) {
   if (blob.size > 2 * 1024 * 1024 || !['image/png', 'image/jpeg'].includes(mime)) return undefined;
   const bytes = new Uint8Array(await blob.arrayBuffer()), view = new DataView(bytes.buffer);
   let width = 0, height = 0;
@@ -90,7 +91,9 @@ export class DirectPeer {
   getSnapshot = () => this.state;
   private update(patch: Partial<PeerState>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(fn => fn()); }
   private transfer(value: FileTransfer) {
-    const transfers = [value, ...this.state.transfers.filter(item => item.id !== value.id)];
+    const transfers = [value, ...this.state.transfers.filter(item => item.id !== value.id)].filter((item, index) => index < 50 || !['sent', 'received', 'failed'].includes(item.phase));
+    const retained = new Set(transfers.map(item => item.id));
+    for (const id of this.progressTimes.keys()) if (!retained.has(id)) this.progressTimes.delete(id);
     this.update({ transfers });
   }
   private progress(id: string, phase: FileTransfer['phase'], bytes: number, error?: string) {
@@ -125,6 +128,9 @@ export class DirectPeer {
     this.update({ transfers: this.state.transfers.map(item => ['sent', 'received', 'failed'].includes(item.phase) ? item : { ...item, phase: 'failed', error: message }) });
     this.disconnect(); this.update({ status: 'failed', error: message });
   }
+  persistItem?: (item: HistoryItem, blob?: Blob) => Promise<unknown>;
+  onHistoryMessage?: (message: Record<string, unknown>) => Promise<void>;
+  sendHistory(message: Record<string, unknown>) { this.ready(); this.control(message); }
   onVersionMismatch?: () => void;
   onPeers?: (peers: string[]) => void;
   sendPeers(peers: string[]) { this.ready(); this.control({ type: 'peers', peers }); }
@@ -138,7 +144,7 @@ export class DirectPeer {
     if (this.channel && this.channel !== channel) { channel.close(); return; }
     check(channel.ordered);
     this.channel = channel; channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = LOW_WATER;
-    const opened = () => { if (epoch === this.epoch) this.control({ type: 'hello', device: this.localDevice, protocol: 2, appVersion: APP_VERSION }); };
+    const opened = () => { if (epoch === this.epoch) this.control({ type: 'hello', device: this.localDevice, protocol: 3, appVersion: APP_VERSION }); };
     channel.addEventListener('open', opened);
     channel.addEventListener('close', () => { if (epoch === this.epoch) this.fail(new Error('Connection closed. Reload to reconnect.')); });
     channel.addEventListener('error', () => { if (epoch === this.epoch) this.fail(new Error('Data transfer failed.')); });
@@ -173,7 +179,7 @@ export class DirectPeer {
     check(data.length <= MAX_CONTROL_BYTES && encoder.encode(data).length <= MAX_CONTROL_BYTES);
     const value = JSON.parse(data); check(value && value.v === 1 && value.session === this.session);
     if (value.type === 'hello') {
-      if (value.protocol !== 2) {
+      if (value.protocol !== 3) {
         this.onVersionMismatch?.();
         throw new Error('Other device uses an older version. Reload both devices.');
       }
@@ -182,25 +188,34 @@ export class DirectPeer {
       this.hello = true; this.update({ status: 'connected', error: null, device: value.device }); return;
     }
     check(this.hello);
+    if (['inventory', 'item-request', 'item-unavailable'].includes(value.type)) {
+      check(this.onHistoryMessage, 'History sync unavailable.');
+      void this.onHistoryMessage(value).catch(error => this.fail(error)); return;
+    }
     if (value.type === 'peers') {
       check(Array.isArray(value.peers) && value.peers.length <= 64 && value.peers.every((id: unknown) => typeof id === 'string' && id.length <= 128));
       this.onPeers?.(value.peers); return;
     }
     if (value.type === 'text') {
       check(typeof value.id === 'string' && uuid.test(value.id) && typeof value.text === 'string' && encoder.encode(value.text).length <= MAX_TEXT_BYTES);
-      if (!this.seen.has(value.id)) this.add({ id: value.id, createdAt: Date.now(), type: 'text', text: value.text }); return;
+      if (this.persistItem) {
+        check(value.item?.id === value.id && value.item.type === 'text', 'Invalid history item.');
+        void this.persistItem({ ...value.item, text: value.text }).catch(error => this.fail(error));
+      } else if (!this.seen.has(value.id)) this.add({ id: value.id, createdAt: Date.now(), type: 'text', text: value.text });
+      return;
     }
     if (value.type === 'file-start') {
       check(!this.incoming && !this.finishing, 'Another file is receiving.');
-      if (typeof value.id !== 'string' || !uuid.test(value.id) || this.seen.has(value.id)) {
+      if (typeof value.id !== 'string' || !uuid.test(value.id) || (!this.persistItem && this.seen.has(value.id))) {
         this.transfer({ id: crypto.randomUUID(), name: 'File', size: 0, createdAt: Date.now(), direction: 'receive', phase: 'failed', bytes: 0, error: 'Malformed file metadata.' });
         throw new Error('Malformed file metadata.');
       }
       this.transfer({ id: value.id, name: typeof value.name === 'string' ? value.name.slice(0, 1024) : 'File', size: typeof value.size === 'number' && Number.isSafeInteger(value.size) && value.size >= 0 ? value.size : 0, createdAt: Date.now(), direction: 'receive', phase: 'receiving', bytes: 0 });
       // Retain the transfer ID so malformed metadata can be rejected explicitly.
-      this.incoming = { id: value.id, name: value.name, mime: value.mime, size: value.size, hash: value.hash, received: 0, chunks: [] };
+      this.incoming = { id: value.id, name: value.name, mime: value.mime, size: value.size, hash: value.hash, item: value.item, received: 0, chunks: [] };
       validFile(value.name, value.mime, value.size);
       check(typeof value.hash === 'string' && /^[0-9a-f]{64}$/.test(value.hash), 'Malformed file checksum.');
+      if (this.persistItem) check(value.item?.id === value.id && value.item.type === 'file' && value.item.size === value.size && value.item.hash === value.hash && value.item.name === value.name && value.item.mimeType === value.mime, 'Invalid history file.');
       this.update({ receiving: { name: value.name, bytes: 0, total: value.size } }); this.receivingTimeout(); return;
     }
     if (value.type === 'file-end') {
@@ -231,6 +246,14 @@ export class DirectPeer {
       console.error('Transfer checksum mismatch', { transferId: incoming.id });
       throw new Error('Transfer failed — checksum mismatch');
     }
+    if (this.persistItem) {
+      await this.persistItem(incoming.item!, blob);
+      if (epoch !== this.epoch) return;
+      this.control({ type: 'file-received', id: incoming.id, hash });
+      this.progress(incoming.id, 'received', incoming.size);
+      clearTimeout(this.receiveTimer); this.incoming = undefined; this.finishing = false; this.update({ receiving: null });
+      return;
+    }
     let previewUrl: string | undefined;
     try { previewUrl = await preview(blob, incoming.mime); }
     catch { console.warn('File preview unavailable', { transferId: incoming.id }); }
@@ -243,9 +266,9 @@ export class DirectPeer {
     this.finishing = false; this.update({ receiving: null });
   }
 
-  sendText(text: string, id = crypto.randomUUID()) {
+  sendText(text: string, id: string = crypto.randomUUID(), item?: HistoryItem) {
     this.ready(); check(!this.state.sending, 'Please wait for the current file transfer.');
-    check(encoder.encode(text).length <= MAX_TEXT_BYTES, 'Text is limited to 12 KiB.'); this.control({ type: 'text', id, text }); this.add({ id, createdAt: Date.now(), type: 'text', text });
+    check(encoder.encode(text).length <= MAX_TEXT_BYTES, 'Text is limited to 12 KiB.'); this.control({ type: 'text', id, text, item: item?.type === 'text' ? { ...item, text: undefined } : item }); if (!this.persistItem) this.add({ id, createdAt: Date.now(), type: 'text', text });
   }
   private async drain(epoch: number) {
     check(epoch === this.epoch && this.channel?.readyState === 'open', 'Peer disconnected.');
@@ -259,7 +282,7 @@ export class DirectPeer {
     });
     check(epoch === this.epoch, 'Connection closed during transfer.');
   }
-  async sendFile(file: File, id = crypto.randomUUID()) {
+  async sendFile(file: File, id: string = crypto.randomUUID(), item?: HistoryItem) {
     this.transfer({ id, name: file.name || 'screenshot.png', size: file.size, createdAt: Date.now(), direction: 'send', phase: 'preparing', bytes: 0 });
     const epoch = this.epoch;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -272,10 +295,11 @@ export class DirectPeer {
       this.update({ sending: { name, bytes: 0, total: file.size } }); started = true;
       this.progress(id, 'hashing', 0);
       const hash = await checksum(file);
+      if (item?.type === 'file') check(hash === item.hash, 'Stored file checksum mismatch.');
       check(epoch === this.epoch && this.channel?.readyState === 'open', 'Peer disconnected.');
       const receipt = new Promise<void>((resolve, reject) => { this.ack = { id, hash, resolve, reject }; });
       void receipt.catch(() => console.warn('File receipt failed', { transferId: id }));
-      this.control({ type: 'file-start', id, name, mime, size: file.size, hash });
+      this.control({ type: 'file-start', id, name, mime, size: file.size, hash, item });
       this.progress(id, 'sending', 0);
       for (let offset = 0; offset < file.size; offset += CHUNK_BYTES) {
         await this.drain(epoch);
@@ -294,6 +318,7 @@ export class DirectPeer {
       this.progress(id, 'verifying', file.size);
       timer = setTimeout(() => this.ack?.reject(new Error('Receiver verification timed out.')), 30000); await receipt;
       check(epoch === this.epoch, 'Peer disconnected.');
+      if (this.persistItem) { this.progress(id, 'sent', file.size); return; }
       let previewUrl: string | undefined;
       try { previewUrl = await preview(file, mime); }
       catch { console.warn('File preview unavailable', { transferId: id }); }

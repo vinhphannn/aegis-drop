@@ -214,7 +214,7 @@ test('compatible protocol connects despite different app build versions', async 
   try {
     const { a, b } = await connect();
     let checked = false; b.onVersionMismatch = () => { checked = true; };
-    a.channel.send(JSON.stringify({ v: 1, session: a.session, type: 'hello', protocol: 2, appVersion: 'another-compatible-build' }));
+    a.channel.send(JSON.stringify({ v: 1, session: a.session, type: 'hello', protocol: 3, appVersion: 'another-compatible-build' }));
     await until(() => checked);
     assert.equal(b.getSnapshot().status, 'connected');
     a.sendText('still connected');

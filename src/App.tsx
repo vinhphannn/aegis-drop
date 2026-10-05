@@ -4,6 +4,8 @@ import type { ClipboardEvent, DragEvent, FormEvent } from 'react';
 import { itemStore, MAX_FILE_SIZE, useItems } from './store';
 import type { DropItem } from './store';
 import { copyTextItem } from './textClipboard';
+import { dropApi } from './api/dropApi';
+import { exposeDownload } from './fileIO';
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -14,6 +16,18 @@ function formatSize(bytes: number) {
 
 function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message: string) => void; busy: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const downloadAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => downloadAbort.current?.abort(), []);
+  async function download() {
+    if (item.type !== 'file' || item.decryptionError || downloading) return;
+    const abort = new AbortController(); downloadAbort.current = abort; setDownloading(true);
+    try {
+      const blob = await dropApi.downloadFile(item, abort.signal);
+      abort.signal.throwIfAborted(); exposeDownload(blob, item.name); announce('File verified and ready to save.');
+    } catch (error) { if (!abort.signal.aborted) announce(error instanceof Error ? error.message : 'File verification failed.'); }
+    finally { downloadAbort.current = null; setDownloading(false); }
+  }
   async function copy() {
     if (item.type !== 'text' || item.decryptionError) return;
     try {
@@ -24,7 +38,7 @@ function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message
       announce('Copy failed. Select the text and copy it manually. Clipboard access requires HTTPS or localhost.');
     }
   }
-  const image = item.type === 'file' && ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'].includes(item.mimeType);
+  const image = item.type === 'file' && !item.decryptionError && ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'].includes(item.mimeType);
   return (
     <article className="item-card">
       <div className="item-heading">
@@ -32,11 +46,12 @@ function ItemCard({ item, announce, busy }: { item: DropItem; announce: (message
         <time dateTime={new Date(item.createdAt).toISOString()}>{new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
       </div>
       {item.type === 'text' ? item.decryptionError ? <p className="text-preview" role="status">Could not decrypt this text. It may be damaged or belong to another vault.</p> : <pre className="text-preview">{item.text}</pre> : <>
-        {image && <a className="image-preview" href={item.url} download={item.name} aria-label={`Download ${item.name}`}><img src={item.url} alt={item.name} /></a>}
+        {item.previewUrl && <button className="image-preview" disabled={downloading || busy} onClick={() => { void download(); }} aria-label={`Download ${item.name}`}><img src={item.previewUrl} alt={item.name} /></button>}
+        {item.decryptionError && <p role="status">Could not decrypt this file. It may be damaged or belong to another vault.</p>}
         <div className="file-info"><span className="file-symbol" aria-hidden="true">{image ? '▧' : '↧'}</span><div><p className="filename">{item.name}</p><p className="file-size">{formatSize(item.size)}</p></div></div>
       </>}
       <div className="item-actions">
-        {item.type === 'text' ? <button disabled={item.decryptionError} onClick={copy}>{copied ? 'Copy again' : 'Copy text'} <span aria-hidden="true">⧉</span></button> : <a href={item.url} download={item.name}>Download <span aria-hidden="true">↓</span></a>}
+        {item.type === 'text' ? <button disabled={item.decryptionError} onClick={copy}>{copied ? 'Copy again' : 'Copy text'} <span aria-hidden="true">⧉</span></button> : <button disabled={busy || downloading || item.decryptionError} onClick={() => { void download(); }}>{downloading ? 'Verifying…' : 'Download'} <span aria-hidden="true">↓</span></button>}
         <button className="delete" disabled={busy} aria-label={`Delete ${item.type === 'text' ? 'text item' : item.name}`} onClick={async () => { try { await itemStore.remove(item.id); announce('Item deleted.'); } catch { /* Store displays request errors. */ } }}>Delete</button>
       </div>
     </article>
@@ -56,7 +71,7 @@ export default function App() {
   async function addFiles(files: File[]) {
     if (!files.length) return;
     if (unavailable) return;
-    if (files.some(file => file.size > MAX_FILE_SIZE)) { setMessage('Files are limited to 100 MiB each.'); return; }
+    if (files.some(file => file.size > MAX_FILE_SIZE)) { setMessage('Files are limited to 8 MiB on the current browser path.'); return; }
     try { await itemStore.addFiles(files); } catch { return; }
     setMessage(`${files.length === 1 ? 'File' : `${files.length} files`} added.`);
   }
@@ -91,7 +106,7 @@ export default function App() {
         <input className="sr-only" ref={picker} tabIndex={-1} type="file" multiple disabled={unavailable} aria-label="Choose files" onChange={event => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
         {dragging && <div className="drop-overlay">Drop to add <span>Images and files welcome</span></div>}
       </form>
-      <div className="composer-note"><span>Paste screenshots directly into the text box.</span><span className="keyboard-hint">⌘ / Ctrl + Enter to send</span></div>
+      <div className="composer-note"><span>Paste screenshots directly. Files up to 8 MiB.</span><span className="keyboard-hint">⌘ / Ctrl + Enter to send</span></div>
       <section className="recent" aria-labelledby="recent-title"><div className="section-heading"><h2 id="recent-title">Recent drops <span>{items.length} loaded</span></h2><button className="refresh" disabled={unavailable} onClick={() => { setMessage(''); void itemStore.load(); }}>Refresh ↻</button></div>
         {loading ? <p className="loading">Loading drops…</p> : items.length ? <div className="items">{items.map(item => <ItemCard key={item.id} item={item} announce={setMessage} busy={unavailable} />)}</div> : <div className="empty"><span aria-hidden="true">↘</span><h3>Room for your next thought.</h3><p>Send some text or add a file to get started.</p></div>}
         {nextCursor && <button className="load-older" disabled={unavailable} onClick={() => { void itemStore.loadOlder(); }}>{loadingOlder ? 'Loading older…' : 'Load older'}</button>}

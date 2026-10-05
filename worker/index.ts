@@ -1,9 +1,10 @@
 import { authenticated, authRoute, AuthError, checkOrigin } from './auth';
-import { MAX_FILE_SIZE } from '../src/model';
+import { MAX_CIPHERTEXT_SIZE } from '../src/model';
 import { cleanup, insertItem, listItems, markDeleted, parsePage, UUID } from './storage';
 import type { Env, ItemRow } from './storage';
 
-import { MAX_TEXT_REQUEST_BYTES, parseTextEnvelope } from '../src/textEnvelope';
+import { encodeTextEnvelope, MAX_TEXT_REQUEST_BYTES, parseTextEnvelope } from '../src/textEnvelope';
+import { decodeEnvelope, equal, sha256 } from '../src/crypto/format';
 class ApiError extends Error {
   constructor(public status: number, message: string, public allow?: string) { super(message); }
 }
@@ -42,31 +43,56 @@ async function createText(request: Request, env: Env) {
   catch { throw new ApiError(400, 'Invalid encrypted text envelope.'); }
   const existing = await env.DB.prepare('SELECT id FROM items WHERE id = ?').bind(payload.id).first();
   if (existing) throw new ApiError(409, 'Item ID already exists.');
-  await insertItem(env, { id: payload.id, type: 'text', text_envelope: payload.envelope as string,
-    file_key: null, file_name: null, mime_type: null, size: bytes.length });
+  await insertItem(env, { id: payload.id, type: 'text', envelope: payload.envelope as string,
+    file_key: null, ciphertext_size: bytes.length });
 }
 
 async function createFile(request: Request, env: Env) {
-  const sizeHeader = request.headers.get('x-file-size');
-  if (!sizeHeader || !/^\d+$/.test(sizeHeader)) throw new ApiError(400, 'X-File-Size must be a byte count.');
+  if (request.headers.get('x-file-name') || request.headers.get('x-file-size')) throw new ApiError(400, 'Plaintext file headers are not accepted.');
+  if (request.headers.get('content-type') !== 'application/octet-stream') throw new ApiError(415, 'Send encrypted binary data.');
+  const id = request.headers.get('x-item-id') || '', sizeHeader = request.headers.get('x-ciphertext-size');
+  if (!UUID.test(id) || !sizeHeader || !/^\d+$/.test(sizeHeader)) throw new ApiError(400, 'Encrypted item ID and ciphertext size are required.');
   const size = Number(sizeHeader);
-  if (!Number.isSafeInteger(size) || size > MAX_FILE_SIZE) throw new ApiError(413, 'Files are limited to 100 MiB.');
-  const contentLength = request.headers.get('content-length');
-  if (contentLength !== null && Number(contentLength) !== size) throw new ApiError(400, 'File size does not match Content-Length.');
-  let name: string;
-  try { name = decodeURIComponent(request.headers.get('x-file-name') ?? ''); }
-  catch { throw new ApiError(400, 'Invalid encoded filename.'); }
-  if (!name || name.length > 1024 || /[\x00-\x1f\x7f]/.test(name)) throw new ApiError(400, 'A valid filename is required (maximum 1024 characters).');
-  const mimeType = request.headers.get('content-type') || 'application/octet-stream';
-  if (!/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+(?:\s*;[^\r\n]*)?$/.test(mimeType) || mimeType.length > 255) {
-    throw new ApiError(400, 'Invalid MIME type.');
+  if (!Number.isSafeInteger(size) || size < 92 || size > MAX_CIPHERTEXT_SIZE) throw new ApiError(413, 'Encrypted file size exceeds the 100 MiB plaintext-equivalent limit.');
+  if (!request.body) throw new ApiError(400, 'Missing encrypted file body.');
+  const reader = request.body.getReader(); let released = false;
+  const releaseReader = () => { if (!released) { released = true; reader.releaseLock(); } };
+  const cancelReader = (reason?: unknown) => { if (!released) { void reader.cancel(reason).catch(() => {}); releaseReader(); } };
+  let current = new Uint8Array(), offset = 0;
+  async function take(count: number) {
+    const out = new Uint8Array(count); let filled = 0;
+    while (filled < count) {
+      if (offset === current.length) { const next = await reader.read(); if (next.done) throw new ApiError(400, 'Truncated file prefix.'); current = next.value; offset = 0; }
+      const n = Math.min(count - filled, current.length - offset); out.set(current.subarray(offset, offset + n), filled); filled += n; offset += n;
+    }
+    return out;
   }
-  const id = crypto.randomUUID();
-  const key = `items/${id}`;
+  let envelope: string, prefix: Uint8Array;
   try {
-    if (size === 0 && !request.body) await env.FILES.put(key, new Uint8Array());
-    else {
-      if (!request.body) throw new ApiError(400, 'Missing file body.');
+    const length = new DataView((await take(4)).buffer).getUint32(0);
+    if (length < 182 || length > 4529) throw new ApiError(400, 'Invalid file envelope length.');
+    const raw = await take(length); envelope = encodeTextEnvelope(raw); parseTextEnvelope(id, envelope, 1);
+    const total = request.headers.get('content-length');
+    if (total !== null && Number(total) !== 4 + length + size) throw new ApiError(400, 'Encrypted request length mismatch.');
+    prefix = await take(92);
+    if (!equal(prefix.subarray(0, 4), new TextEncoder().encode('AGF1')) ||
+      !equal(prefix.subarray(4, 60), decodeEnvelope(raw).header) || !equal(prefix.subarray(60), await sha256(raw))) throw new ApiError(400, 'Encrypted file binding mismatch.');
+    if (await env.DB.prepare('SELECT id FROM items WHERE id = ?').bind(id).first()) throw new ApiError(409, 'Item ID already exists.');
+  } catch (error) { cancelReader(error); if (error instanceof ApiError) throw error; throw new ApiError(400, 'Invalid encrypted file prefix.'); }
+  let first = true;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (first) { first = false; controller.enqueue(prefix); return; }
+        if (offset < current.length) { controller.enqueue(current.subarray(offset)); offset = current.length; return; }
+        const next = await reader.read(); if (next.done) { controller.close(); releaseReader(); } else controller.enqueue(next.value);
+      } catch (error) { controller.error(error); }
+    },
+    cancel(reason) { cancelReader(reason); },
+  });
+  const key = `items/${crypto.randomUUID()}`;
+  try {
+    {
       // FixedLengthStream verifies actual byte count and supplies R2 a known
       // length. No multipart buffering, arrayBuffer(), or base64 conversion.
       const stream = new FixedLengthStream(size);
@@ -84,11 +110,15 @@ async function createFile(request: Request, env: Env) {
         },
       });
       const results = await Promise.allSettled([
-        request.body.pipeThrough(checkSize).pipeTo(stream.writable, { signal: abort.signal }),
+        body.pipeThrough(checkSize).pipeTo(stream.writable, { signal: abort.signal }),
         Promise.resolve().then(() => env.FILES.put(key, stream.readable)).catch(error => {
           // A put can fail before it consumes the stream. Unblock the producer
           // and cancel its source instead of waiting forever on backpressure.
           abort.abort(error);
+          // R2 may fail without ever locking/reading FixedLengthStream. Cancel
+          // its unused readable side too, so a pending small prefix write settles.
+          void stream.readable.cancel(error).catch(() => {});
+          cancelReader(error);
           throw error;
         }),
       ]);
@@ -97,8 +127,7 @@ async function createFile(request: Request, env: Env) {
         if (result.status === 'rejected') throw result.reason;
       }
     }
-    await insertItem(env, { id, type: 'file', text_envelope: null,
-      file_key: key, file_name: name, mime_type: mimeType, size });
+    await insertItem(env, { id, type: 'file', envelope, file_key: key, ciphertext_size: size });
   } catch (error) {
     // A transport error is not proof of rollback: D1 may have committed before
     // its acknowledgement was lost. Never delete bytes still owned by any row,
@@ -111,19 +140,14 @@ async function createFile(request: Request, env: Env) {
   }
 }
 
-function attachment(name: string) {
-  const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, '_');
-  const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
-}
 async function download(env: Env, id: string) {
   const row = await env.DB.prepare('SELECT * FROM items WHERE id = ? AND pending_delete = 0').bind(id).first<ItemRow>();
   if (!row || row.type !== 'file') throw new ApiError(404, 'File not found.');
   const object = await env.FILES.get(row.file_key!);
   if (!object) throw new ApiError(404, 'File not found.');
   return new Response(object.body, { headers: {
-    'Content-Type': row.mime_type!, 'Content-Length': String(object.size),
-    'Content-Disposition': attachment(row.file_name!), 'X-Content-Type-Options': 'nosniff',
+    'Content-Type': 'application/octet-stream', 'Content-Length': String(object.size),
+    'Content-Disposition': `attachment; filename="${id}.agd"`, 'X-Content-Type-Options': 'nosniff',
     'Content-Security-Policy': "sandbox; default-src 'none'", 'Cache-Control': 'no-store',
   } });
 }

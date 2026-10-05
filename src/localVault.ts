@@ -1,6 +1,9 @@
 import { decodeDescriptor, domain, equal, requireValue, sha256, sized, uint } from './crypto/format';
 import { createDescriptor, decrypt, encrypt, generateItemId, generateVault, randomBytes } from './crypto/keys';
 import { openText, sealText } from './crypto/itemCrypto';
+import { openFileManifest, sealFileManifest } from './crypto/fileCrypto';
+import type { ByteSource } from './crypto/fileCrypto';
+import type { FileManifest } from './crypto/format';
 import { encodeTextEnvelope, itemIdString, parseTextEnvelope } from './textEnvelope';
 import { decodeRootBundle, encodeRootBundle } from './crypto/recovery';
 import { VaultStorageError } from './localVaultStorage';
@@ -36,6 +39,26 @@ export async function decryptVaultText(id: string, envelope: unknown) {
   const { handle, key } = unlocked(), parsed = parseTextEnvelope(id, envelope);
   const opened = await openText(key, parsed.bytes, { vaultId: handle.vaultId, epochId: handle.epochId, itemId: parsed.header.itemId });
   stillUnlocked(handle); return opened.text;
+}
+export async function prepareVaultFile(metadata: Omit<FileManifest, 'kind'>) {
+  const { handle, key } = unlocked(), itemId = generateItemId();
+  const sealed = await sealFileManifest(key, { vaultId: handle.vaultId, epochId: handle.epochId, itemId }, metadata);
+  stillUnlocked(handle);
+  return { id: itemIdString(itemId), envelope: sealed.envelope,
+    async *encrypt(source: ByteSource) {
+      for await (const bytes of sealed.encrypt(source)) { stillUnlocked(handle); yield bytes; }
+      stillUnlocked(handle);
+    } };
+}
+export async function openVaultFile(id: string, envelope: unknown) {
+  const { handle, key } = unlocked(), parsed = parseTextEnvelope(id, envelope, 1);
+  const opened = await openFileManifest(key, parsed.bytes, { vaultId: handle.vaultId, epochId: handle.epochId, itemId: parsed.header.itemId });
+  stillUnlocked(handle);
+  return { manifest: opened.manifest, assertLive: () => stillUnlocked(handle),
+    async *decrypt(source: ByteSource) {
+      for await (const bytes of opened.decrypt(source)) { stillUnlocked(handle); yield bytes; }
+      stillUnlocked(handle);
+    } };
 }
 const damaged = () => new VaultStorageError('damaged');
 function aad(record: Enrollment) {

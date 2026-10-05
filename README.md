@@ -1,12 +1,12 @@
-# AEGIS Drop — Phase 4B.1B
+# AEGIS Drop — Phase 4B.2
 
 A small React + TypeScript clipboard with a Cloudflare Worker, D1 and private R2.
-Text is encrypted/decrypted in the browser with an independently generated local
-vault. The Worker and active D1 schema receive only text envelopes. Files still
-use the existing unencrypted path. Pairing, recovery UI, realtime and Google auth
+Text and files are encrypted/decrypted in the browser with an independently generated local
+vault. The Worker/D1 receive opaque envelopes and R2 stores only encrypted file objects
+on the active path. The current browser fallback is explicitly limited to 8 MiB. Pairing, recovery UI, realtime and Google auth
 are not implemented. Keep this browser's local vault data to read its text again.
 
-See [Phase 4B.1B local run and smoke test](docs/phase4b1b-text-e2ee.md).
+See [Phase 4B.2 file/image E2EE and smoke test](docs/phase4b2-file-e2ee.md).
 ## Install and local development
 
 Use Node.js 22 or newer.
@@ -49,8 +49,7 @@ without signing out. Reload requires local vault unlock again.
 
 Type/paste text, click **Send text** or Ctrl/Cmd + Enter, paste an image into the
 text box, drop files on the composer, or use **Add files**. Enter adds a newline.
-Copy text, download files, and delete items from the list. Supported raster images
-show previews. Copy requires localhost or HTTPS. The server list loads on startup
+Copy text, download files, and delete items from the list. Verified PNG/JPEG images within preview byte/pixel bounds show local previews. Copy requires localhost or HTTPS. The server list loads on startup
 and after mutations (newest five); **Refresh** restarts at the newest page and
 fetches changes made by another device. **Load older** appends five more items,
 without duplicates, until the end of history. Failed pages preserve loaded items
@@ -106,7 +105,7 @@ for the owner to execute and have not been run remotely here.
 | `POST /api/auth/logout` | session cookie | clears cookie |
 | `GET /api/items?limit=5&cursor=...` | optional limit/cursor | `{ "items": [...], "nextCursor": "..." or null }` |
 | `POST /api/items/text` | JSON `{ "id": "<client UUIDv4>", "envelope": "<canonical base64url>" }` | 201 `{ "ok": true }` |
-| `POST /api/items/file` | raw binary body + headers below | 201 `{ "ok": true }` |
+| `POST /api/items/file` | opaque envelope prefix + encrypted object + headers below | 201 `{ "ok": true }` |
 | `GET /api/items/:id/file` | none | streamed attachment |
 | `DELETE /api/items/:id` | none | `{ "ok": true }` |
 
@@ -120,38 +119,40 @@ Errors return `{ "error": "..." }` with a 4xx/5xx status. Missing items return
 size limits return 413. API responses are not cached. There is no CORS policy for
 other origins: the frontend uses the same origin or Vite's development proxy.
 
-File upload headers:
+Encrypted file upload headers:
 
-- `X-File-Name`: `encodeURIComponent(originalFilename)` (maximum 1024 characters).
-- `X-File-Size`: exact nonnegative byte count.
-- `Content-Type`: original MIME type, or `application/octet-stream`.
+- `X-Item-Id`: canonical client UUIDv4, bound by the encrypted envelope.
+- `X-Ciphertext-Size`: exact AGF1 object byte count, excluding the envelope prefix.
+- `Content-Type`: always `application/octet-stream`.
 
-The backend limit is **100 MiB (104,857,600 bytes)** per file. `Content-Length`,
-when supplied, must agree with the declared size. Workers' `FixedLengthStream`
-also verifies actual bytes, including requests without Content-Length, and streams
-to R2 without buffering the entire file or base64 conversion. Zero-byte files
-are accepted. Text is limited to 64 KiB UTF-8; JSON request bodies are bounded too.
-The server validates text envelope framing, version, inline kind and ID binding;
-it does not have the vault key or authenticate the encrypted manifest. The browser
-verifies that manifest before displaying/copying text. Corrupted/wrong-vault text
-shows a per-item failure card with Delete available. Text request JSON is bounded
-to 90,000 bytes to accommodate envelope/base64 overhead.
+Body is u32be(envelope byte length), binary AGD1 file envelope, then the frozen
+AGF1 object. No plaintext filename/MIME/byte count is sent. R2 keys remain fresh
+server-generated UUIDs. FixedLengthStream validates/streams the encrypted object.
+The backend allows 104,859,692 ciphertext bytes (100 MiB plaintext plus frozen
+framing); current browser upload/download fallback is **8 MiB plaintext maximum**.
+It is bounded RAM, not an OPFS or large-file streaming claim. Zero-byte files work.
 
-R2 keys are generated UUIDs (`items/<uuid>`), never user filenames. Downloads
-preserve the original MIME and filename (including UTF-8 names) and always use
-`Content-Disposition: attachment`, `nosniff`, and sandbox CSP. HTML/SVG are not
-previewed by the UI. Raster image previews use the same download endpoint.
+Downloads return generic ciphertext attachments named by item ID with nosniff,
+sandbox CSP and no-store. The browser authenticates manifest, every chunk and EOF
+before exposing the original file. HTML/SVG remain downloads, never previews.
+PNG/JPEG preview requires <=2 MiB, <=4 million pixels and <=8192 per dimension;
+at most four cached previews, <=8 MiB total encoded bytes. Lock/delete/refresh
+release local URLs; nothing is persisted as an item cache in browser storage.
 
 ## Schema, history, and failure ordering
 
-The active **items** table contains `id`, `type` (`text` or `file`), `text_envelope`,
-`file_key`, `file_name`, `mime_type`, `size`, `created_at`, and `pending_delete`.
-Checks enforce type-specific fields and nonnegative sizes. `created_at` comes
-from D1's clock. Ordering is `created_at DESC, id DESC`, including timestamp ties.
-Migration 0003 rebuilds the table without the old plaintext column, discards
-pre-E2EE text rows, and preserves file rows. This is a pre-deployment local-dev reset,
-not an automatic encryption migration. Historical migration 0001 is not an active
-plaintext compatibility path. Text size records envelope bytes, not plaintext bytes.
+The active **items** table contains `id`, `type`, `envelope`, `file_key`,
+`ciphertext_size`, `created_at` and `pending_delete`. No plaintext filename, MIME,
+text or plaintext byte-count column remains. Ciphertext length still reveals nearly
+exact file size under the frozen unpadded framing. Server ordering/cursors remain
+`created_at DESC, id DESC`.
+
+Migration 0003 discards pre-E2EE text. Migration 0004 preserves encrypted text,
+removes plaintext file metadata, and hides/queues old file keys for normal R2 cleanup.
+Legacy files are not converted or exposed through a plaintext compatibility path.
+Apply migrations locally before starting this version. Historical migration schemas
+are not the active storage model. Old SQLite pages/backups/orphan objects are not
+claimed securely erased by this schema change.
 
 Text and files persist until explicitly deleted. Insertion performs one INSERT;
 there is no automatic retention, eviction, storage quota, or content indexing.

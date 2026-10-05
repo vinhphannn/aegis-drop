@@ -1,6 +1,7 @@
 import { CHUNK_SIZE, Reader, chunkCount, concat, decodeEnvelope, decodeHeader, domain, encoder, equal, requireValue, sha256, uint } from './format';
 import type { FileManifest, ItemContext } from './format';
 import { decrypt, encrypt } from './keys';
+import type { VaultSecret } from './keys';
 import { openManifest, sealManifest } from './itemCrypto';
 
 export type ByteSource = AsyncIterable<Uint8Array>;
@@ -57,7 +58,7 @@ class SourceReader {
   }
   async close() { await this.iterator.return?.(); }
 }
-export async function sealFileManifest(master: Uint8Array, context: ItemContext, metadata: Omit<FileManifest, 'kind'>) {
+export async function sealFileManifest(master: VaultSecret, context: ItemContext, metadata: Omit<FileManifest, 'kind'>) {
   const manifest: FileManifest = Object.freeze({ ...metadata, kind: 'file' });
   const sealed = await sealManifest(master, context, manifest);
   const header = decodeEnvelope(sealed.envelope).header, digest = await sha256(sealed.envelope);
@@ -82,7 +83,7 @@ export async function sealFileManifest(master: Uint8Array, context: ItemContext,
     },
   };
 }
-export async function openFileManifest(master: Uint8Array, envelope: Uint8Array, expected: ItemContext) {
+export async function openFileManifest(master: VaultSecret, envelope: Uint8Array, expected: ItemContext) {
   const snapshot = new Uint8Array(envelope), opened = await openManifest(master, snapshot, expected, 1);
   const manifest = Object.freeze(opened.manifest as FileManifest);
   const header = decodeEnvelope(snapshot).header, digest = await sha256(snapshot), key = opened.fileKey!;

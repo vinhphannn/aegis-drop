@@ -82,7 +82,7 @@ test('Worker API with real local D1 and R2', async t => {
       for (const statement of sql.split(';').filter(part => part.trim())) await db.prepare(statement).run();
     }
     await migrate('migrations/0001_items.sql');
-    const existingId = crypto.randomUUID();
+    let existingId = crypto.randomUUID();
     await bucket.put(`items/${existingId}`, 'existing bytes');
     await db.prepare("INSERT INTO items (id,type,file_key,file_name,mime_type,size) VALUES (?, 'file', ?, 'existing.bin', 'application/octet-stream', 14)").bind(existingId, `items/${existingId}`).run();
     await migrate('migrations/0002_history_index.sql');
@@ -95,9 +95,24 @@ test('Worker API with real local D1 and R2', async t => {
       assert.ok(!columns.includes('text_content')); assert.ok(columns.includes('text_envelope'));
       assert.ok(await db.prepare('SELECT id FROM items WHERE id = ?').bind(existingId).first());
     });
+    await migrate('migrations/0004_file_e2ee.sql');
+    await t.test('file E2EE migration retires plaintext metadata and queues old keys for cleanup', async () => {
+      const row = await db.prepare('SELECT * FROM items WHERE id = ?').bind(existingId).first();
+      assert.equal(row.pending_delete, 1); assert.equal(row.ciphertext_size, 0);
+      const columns = (await db.prepare('PRAGMA table_info(items)').all()).results.map(row => row.name);
+      for (const field of ['file_name', 'mime_type', 'size', 'text_envelope']) assert.ok(!columns.includes(field));
+      await db.prepare('DELETE FROM items WHERE id = ?').bind(existingId).run(); await bucket.delete(`items/${existingId}`);
+      const operation = await L.prepareVaultFile({ name: 'existing.bin', size: 14, mimeType: 'application/octet-stream', createdAt: 1 });
+      existingId = operation.id;
+      const records = []; for await (const chunk of operation.encrypt((async function* () { yield new TextEncoder().encode('existing bytes'); })())) records.push(chunk);
+      const object = Buffer.concat(records.map(b => Buffer.from(b)));
+      const encoded = Buffer.from(operation.envelope).toString('base64url');
+      await bucket.put(`items/${existingId}`, object);
+      await db.prepare("INSERT INTO items (id,type,envelope,file_key,ciphertext_size) VALUES (?,'file',?,?,?)").bind(existingId, encoded, `items/${existingId}`, object.length).run();
+    });
     await t.test('history index upgrade preserves existing rows and uses an indexed cursor seek', async () => {
       assert.equal((await db.prepare('SELECT file_key FROM items WHERE id = ?').bind(existingId).first()).file_key, `items/${existingId}`);
-      assert.equal(await (await bucket.get(`items/${existingId}`)).text(), 'existing bytes');
+      assert.ok((await bucket.get(`items/${existingId}`)).size > 14, 'R2 stores encrypted framing');
       const plan = (await db.prepare('EXPLAIN QUERY PLAN SELECT * FROM items WHERE pending_delete = 0 AND (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?').bind(Date.now(), existingId, 6).all()).results;
       assert.ok(plan.some(row => row.detail.includes('items_recent')));
       assert.ok(!plan.some(row => row.detail.includes('TEMP B-TREE')), 'no whole-history sort for an older page');
@@ -185,16 +200,38 @@ test('Worker API with real local D1 and R2', async t => {
     const page = async (query = '') => { const response = await fetch(`/api/items${query}`); assert.equal(response.status, 200); const wire = await response.json();
       // Client-side decrypt only: the Worker list never returns these plaintext fields.
       return { ...wire, items: await Promise.all(wire.items.map(async item => item.type === 'text'
-        ? { ...item, text: await L.decryptVaultText(item.id, item.envelope) } : item)) }; };
+        ? { ...item, text: await L.decryptVaultText(item.id, item.envelope) } : { ...item, ...await (async () => { const { manifest } = await L.openVaultFile(item.id, item.envelope); return { name: manifest.name, size: manifest.size, mimeType: manifest.mimeType }; })() })) }; };
     const list = async () => (await page()).items;
     const textIds = new Map();
     const text = async value => {
       const payload = await L.encryptVaultText(value); textIds.set(value, payload.id);
       return fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     };
-    const file = (name, body, headers = {}) => fetch('/api/items/file', { method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(name),
-        'X-File-Size': String(Buffer.byteLength(body)), ...headers }, body });
+    async function filePayload(name, body, mimeType = 'application/octet-stream') {
+      const bytes = Buffer.from(body);
+      const operation = await L.prepareVaultFile({ name, size: bytes.length, mimeType, createdAt: 1 });
+      const records = []; for await (const chunk of operation.encrypt((async function* () {
+        for (let i = 0; i < bytes.length; i += 65536) yield bytes.subarray(i, i + 65536);
+      })())) records.push(Buffer.from(chunk));
+      const object = Buffer.concat(records), length = Buffer.alloc(4); length.writeUInt32BE(operation.envelope.length);
+      return { id: operation.id, envelope: Buffer.from(operation.envelope).toString('base64url'), object,
+        body: Buffer.concat([length, operation.envelope, object]), headers: { 'Content-Type': 'application/octet-stream', 'X-Item-Id': operation.id, 'X-Ciphertext-Size': String(object.length) } };
+    }
+    const file = async (name, body, headers = {}) => {
+      const payload = await filePayload(name, body, headers['Content-Type'] || 'application/octet-stream');
+      const extra = { ...headers }; delete extra['Content-Type'];
+      return fetch('/api/items/file', { method: 'POST', headers: { ...payload.headers, ...extra }, body: payload.body });
+    };
+    async function downloadItem(item) {
+      const response = await fetch(item.url); if (!response.ok) return response;
+      const opened = await L.openVaultFile(item.id, item.envelope);
+      async function* bounded() { for await (const block of response.body) for (let i = 0; i < block.length; i += 65536) yield block.subarray(i, i + 65536); }
+      const iterator = opened.decrypt(bounded());
+      return new Response(new ReadableStream({ async pull(controller) {
+        try { const next = await iterator.next(); if (next.done) controller.close(); else controller.enqueue(next.value); }
+        catch (error) { controller.error(error); }
+      }, async cancel() { await iterator.return(); } }), { headers: response.headers });
+    }
     async function reset() {
       await db.prepare('DELETE FROM items').run();
       const objects = await bucket.list();
@@ -219,7 +256,7 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal(older.nextCursor, null);
       assert.equal(new Set([...first.items, ...older.items].map(item => item.id)).size, 8);
       assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM items').first()).n, 8);
-      assert.equal(await (await fetch(old.url)).text(), 'old bytes');
+      assert.equal(await (await downloadItem(old)).text(), 'old bytes');
       assert.ok(await bucket.head(row.file_key));
       assert.equal((await fetch(`/api/items/${old.id}`, { method: 'DELETE' })).status, 200);
       assert.equal(await bucket.head(row.file_key), null);
@@ -246,7 +283,7 @@ test('Worker API with real local D1 and R2', async t => {
         assert.ok(items.every(item => item.createdAt === 123456789));
         assert.deepEqual((await bucket.list()).objects.map(object => object.key).sort(), rows.filter(row => row.type === 'file').map(row => row.file_key).sort());
         for (const item of items.filter(item => item.type === 'file')) {
-          assert.equal(await (await fetch(item.url)).text(), `file ${parseInt(item.name, 10)}`);
+          assert.equal(await (await downloadItem(item)).text(), `file ${parseInt(item.name, 10)}`);
         }
       } finally { await db.prepare('DROP TRIGGER collide_time').run(); }
     });
@@ -292,11 +329,12 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal((await file(name, bytes)).status, 201);
       const item = (await list())[0];
       assert.equal(item.name, name); assert.equal(item.size, bytes.length);
-      const response = await fetch(item.url);
+      const response = await downloadItem(item);
       assert.equal(response.status, 200);
       assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
       assert.ok(response.headers.get('content-disposition').startsWith('attachment;'));
-      assert.ok(response.headers.get('content-disposition').includes('filename*=UTF-8'));
+      assert.equal(response.headers.get('content-disposition'), `attachment; filename="${item.id}.agd"`);
+      assert.equal(response.headers.get('content-type'), 'application/octet-stream');
       assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
       assert.ok(response.headers.get('content-security-policy').includes('sandbox'));
     });
@@ -304,12 +342,13 @@ test('Worker API with real local D1 and R2', async t => {
       await reset();
       for (const mime of ['text/html', 'image/svg+xml']) {
         assert.equal((await file('unsafe-file', '<script>alert(1)</script>', { 'Content-Type': mime })).status, 201);
-        const response = await fetch((await list())[0].url);
-        assert.equal(response.headers.get('content-type'), mime);
+        const response = await downloadItem((await list())[0]);
+        assert.equal(response.headers.get('content-type'), 'application/octet-stream');
+        assert.equal((await list())[0].mimeType, mime);
         assert.ok(response.headers.get('content-disposition').startsWith('attachment;'));
       }
       assert.equal((await file('empty.bin', '')).status, 201);
-      const response = await fetch((await list())[0].url);
+      const response = await downloadItem((await list())[0]);
       assert.equal((await response.arrayBuffer()).byteLength, 0);
     });
     await t.test('delete text/file, repeated delete and invalid file lookup', async () => {
@@ -340,22 +379,20 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal(responses.filter(response => response.status === 404).length, 5);
       assert.equal(responses[6].status, 201);
       assert.equal((await fetch(deleted.url)).status, 404);
-      assert.equal(await (await fetch(kept.url)).text(), 'keep bytes');
+      assert.equal(await (await downloadItem(kept)).text(), 'keep bytes');
       const rows = (await db.prepare('SELECT file_key FROM items WHERE pending_delete = 0').all()).results;
       assert.deepEqual((await bucket.list()).objects.map(object => object.key).sort(), rows.map(row => row.file_key).sort());
     });
     await t.test('filename injection, Content-Type and method errors use safe consistent headers', async () => {
       await reset();
       for (const name of ['bad\r\nX-Evil: value.bin', 'bad\u0000.bin']) {
-        assert.equal((await file(name, 'bytes')).status, 400);
+        await assert.rejects(L.prepareVaultFile({ name, size: 1, mimeType: 'application/octet-stream', createdAt: 0 }));
       }
-      const name = 'a;"\\%file-é.bin';
-      assert.equal((await file(name, 'bytes')).status, 201);
-      const response = await fetch((await list())[0].url);
-      const disposition = response.headers.get('content-disposition');
-      assert.ok(disposition.startsWith('attachment; filename="'));
-      assert.ok(!disposition.includes('\r') && !disposition.includes('\n'));
-      assert.equal(decodeURIComponent(disposition.split("filename*=UTF-8''")[1]), name);
+      const name = 'a;"%file-é.bin'; assert.equal((await file(name, 'bytes')).status, 201);
+      const item = (await list())[0], response = await fetch(item.url);
+      assert.equal(item.name, name);
+      assert.equal(response.headers.get('content-disposition'), `attachment; filename="${item.id}.agd"`);
+      assert.ok(!response.headers.get('content-disposition').includes(name));
       assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/jsonp' }, body: '{"text":"wrong mime"}' })).status, 415);
       assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'Application/JSON; charset=utf-8' }, body: JSON.stringify(await L.encryptVaultText('valid mime')) })).status, 201);
       for (const [path, method, allow] of [['/api/items/file', 'GET', 'POST'], ['/api/items/text', 'DELETE', 'POST'], ['/api/items', 'POST', 'GET']]) {
@@ -365,12 +402,12 @@ test('Worker API with real local D1 and R2', async t => {
     });
     await t.test('oversized headers, mismatched bytes, malformed payloads and invalid IDs/types', async () => {
       await reset();
-      assert.equal((await file('huge.bin', '', { 'X-File-Size': String(100 * 1024 * 1024 + 1) })).status, 413);
-      assert.equal((await file('lie.bin', '123', { 'X-File-Size': '2' })).status, 400);
-      assert.equal((await file('lie.bin', '1', { 'X-File-Size': '2' })).status, 400);
-      assert.equal((await file('bad.bin', '1', { 'X-File-Name': '%ZZ' })).status, 400);
-      assert.equal((await file('bad.bin', '1', { 'X-File-Size': '-1' })).status, 400);
-      assert.equal((await file('bad.bin', '1', { 'Content-Type': 'invalid' })).status, 400);
+      const valid = await filePayload('lie.bin', '123');
+      for (const headers of [{ 'X-Ciphertext-Size': '104859693' }, { 'X-Ciphertext-Size': '92' },
+        { 'X-Ciphertext-Size': '999' }, { 'X-File-Name': 'plaintext.bin' }, { 'X-Ciphertext-Size': '-1' }, { 'Content-Type': 'text/plain' }]) {
+        const response = await fetch('/api/items/file', { method: 'POST', headers: { ...valid.headers, ...headers }, body: valid.body });
+        assert.ok([400, 413, 415].includes(response.status));
+      }
       assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: '  ' }) })).status, 400);
       await assert.rejects(L.encryptVaultText('a'.repeat(65537)));
       assert.equal((await fetch('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'x'.repeat(90001) })).status, 413);
@@ -383,45 +420,27 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal((await fetch('/api/missing')).status, 404);
       assert.equal((await list()).length, 0);
       assert.equal((await bucket.list()).objects.length, 0);
-      await assert.rejects(db.prepare("INSERT INTO items (id,type,size) VALUES ('invalid','other',0)").run());
+      await assert.rejects(db.prepare("INSERT INTO items (id,type,ciphertext_size) VALUES ('invalid','other',0)").run());
     });
-    await t.test('streamed upload accepts exactly 100 MiB without a full-file JS buffer', async () => {
-      await reset();
-      const size = 100 * 1024 * 1024;
-      let remaining = size;
-      const expectedHash = createHash('sha256');
-      let chunkIndex = 0;
-      const body = new ReadableStream({ pull(controller) {
-        if (!remaining) { controller.close(); return; }
-        const chunk = new Uint8Array(Math.min(64 * 1024, remaining));
-        chunk.fill(chunkIndex++ % 251);
-        expectedHash.update(chunk);
-        remaining -= chunk.byteLength;
-        controller.enqueue(chunk);
-      } });
-      const response = await fetch('/api/items/file', { method: 'POST',
-        headers: { 'X-File-Name': 'limit.bin', 'X-File-Size': String(size), 'Content-Type': 'application/octet-stream' }, body, duplex: 'half' });
-      assert.equal(response.status, 201, await response.text());
-      const item = (await list())[0];
-      assert.equal(item.size, size);
+    await t.test('streamed encrypted upload retains 100 MiB backend limit without a full-file JS buffer', async () => {
+      await reset(); const size = 100 * 1024 * 1024, expectedHash = createHash('sha256');
+      const operation = await L.prepareVaultFile({ size, name: 'limit.bin', mimeType: 'application/octet-stream', createdAt: 0 });
+      async function* source() { for (let i = 0; i < size / 65536; i++) { const block = new Uint8Array(65536).fill(i % 251); expectedHash.update(block); yield block; } }
+      async function* upload() { const prefix = Buffer.alloc(4); prefix.writeUInt32BE(operation.envelope.length); yield prefix; yield operation.envelope; yield* operation.encrypt(source()); }
+      const iterator = upload(), body = new ReadableStream({ async pull(controller) { const next = await iterator.next(); if (next.done) controller.close(); else controller.enqueue(next.value); }, async cancel() { await iterator.return(); } });
+      const response = await fetch('/api/items/file', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Item-Id': operation.id, 'X-Ciphertext-Size': String(size + 20 * 100 + 92) }, body, duplex: 'half' });
+      assert.equal(response.status, 201, await response.text()); const item = (await list())[0]; assert.equal(item.size, size);
       const row = await db.prepare('SELECT file_key FROM items WHERE id = ?').bind(item.id).first();
-      assert.equal((await bucket.head(row.file_key)).size, size);
-      const download = await fetch(item.url);
-      assert.equal(download.status, 200);
-      const actualHash = createHash('sha256');
-      let received = 0;
-      for await (const chunk of download.body) { actualHash.update(chunk); received += chunk.byteLength; }
-      assert.equal(received, size);
-      assert.equal(actualHash.digest('hex'), expectedHash.digest('hex'));
+      assert.equal((await bucket.head(row.file_key)).size, size + 2092);
+      const actualHash = createHash('sha256'); let received = 0;
+      for await (const chunk of (await downloadItem(item)).body) { actualHash.update(chunk); received += chunk.length; }
+      assert.equal(received, size); assert.equal(actualHash.digest('hex'), expectedHash.digest('hex'));
     });
-    await t.test('stream rejects a lying byte count even without Content-Length', async () => {
-      await reset();
-      const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(3)); controller.close(); } });
-      const response = await fetch('/api/items/file', { method: 'POST',
-        headers: { 'X-File-Name': 'lie.bin', 'X-File-Size': '2', 'Content-Type': 'application/octet-stream' }, body, duplex: 'half' });
-      assert.equal(response.status, 400);
-      assert.equal((await list()).length, 0);
-      assert.equal((await bucket.list()).objects.length, 0);
+    await t.test('stream rejects lying ciphertext count without Content-Length', async () => {
+      await reset(); const payload = await filePayload('lie.bin', 'bytes');
+      const body = new ReadableStream({ start(controller) { controller.enqueue(payload.body); controller.close(); } });
+      const response = await fetch('/api/items/file', { method: 'POST', headers: { ...payload.headers, 'X-Ciphertext-Size': String(payload.object.length + 1) }, body, duplex: 'half' });
+      assert.equal(response.status, 400); assert.equal((await list()).length, 0); assert.equal((await bucket.list()).objects.length, 0);
     });
     await t.test('D1 insertion failure compensates R2 upload and preserves prior items', async () => {
       await reset();
@@ -435,12 +454,8 @@ test('Worker API with real local D1 and R2', async t => {
     });
     await t.test('early R2 failure settles the upload instead of leaving the producer blocked', async () => {
       await reset();
-      const body = new ReadableStream({ start(controller) {
-        controller.enqueue(new Uint8Array(64 * 1024)); controller.close();
-      } });
-      const response = await fetch('/api/items/file', { method: 'POST',
-        headers: { 'X-File-Name': 'failed.bin', 'X-File-Size': '65536', 'Content-Type': 'application/octet-stream', 'X-Test-Fail-Put': '1' },
-        body, duplex: 'half', signal: AbortSignal.timeout(1500) });
+      const payload = await filePayload('failed.bin', new Uint8Array(65536));
+      const response = await fetch('/api/items/file', { method: 'POST', headers: { ...payload.headers, 'X-Test-Fail-Put': '1' }, body: payload.body, signal: AbortSignal.timeout(1500) });
       assert.equal(response.status, 500);
       assert.equal((await bucket.list()).objects.length, 0);
       assert.equal((await list()).length, 0);
@@ -449,14 +464,14 @@ test('Worker API with real local D1 and R2', async t => {
       await reset();
       assert.equal((await file('uncertain.bin', 'keep if uncertain', { 'X-Test-Lost-Commit-Ack': '1', 'X-Test-Fail-Owner-Read': '1' })).status, 500);
       const item = (await list())[0];
-      assert.equal(await (await fetch(item.url)).text(), 'keep if uncertain');
+      assert.equal(await (await downloadItem(item)).text(), 'keep if uncertain');
     });
     await t.test('cleanup batches stay within free-plan budgets and drain a backlog across requests', async () => {
       await reset();
       for (let i = 0; i < 25; i++) {
         const id = crypto.randomUUID();
-        await bucket.put(`items/${id}`, 'pending');
-        await db.prepare('INSERT INTO items (id,type,file_key,file_name,mime_type,size,pending_delete) VALUES (?,\'file\',?,\'pending.bin\',\'application/octet-stream\',7,1)').bind(id, `items/${id}`).run();
+        await bucket.put(`items/${id}`, new Uint8Array(92));
+        await db.prepare('INSERT INTO items (id,type,file_key,ciphertext_size,pending_delete) VALUES (?,\'file\',?,0,1)').bind(id, `items/${id}`).run();
       }
       assert.equal((await list()).length, 0);
       assert.equal((await bucket.list()).objects.length, 15, 'one request processes at most ten pending objects');
@@ -469,7 +484,7 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal((await file('committed.bin', 'keep bytes', { 'X-Test-Lost-Commit-Ack': '1' })).status, 500);
       const item = (await list())[0];
       assert.equal(item.name, 'committed.bin');
-      const response = await fetch(item.url);
+      const response = await downloadItem(item);
       assert.equal(response.status, 200);
       assert.equal(await response.text(), 'keep bytes');
     });
@@ -492,7 +507,7 @@ test('Worker API with real local D1 and R2', async t => {
       assert.equal(wire.items[0].text, undefined); assert.equal(wire.items[0].envelope, payload.envelope);
       const row = await db.prepare('SELECT * FROM items WHERE id = ?').bind(payload.id).first();
       assert.ok(!JSON.stringify(row).includes(original)); assert.equal(row.text_content, undefined);
-      assert.equal(await L.decryptVaultText(payload.id, row.text_envelope), original);
+      assert.equal(await L.decryptVaultText(payload.id, row.envelope), original);
       assert.equal((await post({ text: original })).status, 400);
       assert.equal((await post({ ...payload, text: original })).status, 400);
       assert.equal((await post({ ...payload, id: crypto.randomUUID() })).status, 400);
@@ -535,9 +550,9 @@ test('Worker API with real local D1 and R2', async t => {
         L.activateVault(await L.unlockEnrollment(saved));
         for (let i = 0; i < 6; i++) await itemStore.addText(`page ${i}`);
         const newest = itemStore.getSnapshot().items[0];
-        const row = await db.prepare('SELECT text_envelope FROM items WHERE id = ?').bind(newest.id).first();
-        const changed = Buffer.from(row.text_envelope, 'base64url'); changed[changed.length - 1] ^= 1;
-        await db.prepare('UPDATE items SET text_envelope = ? WHERE id = ?').bind(changed.toString('base64url'), newest.id).run();
+        const row = await db.prepare('SELECT envelope FROM items WHERE id = ?').bind(newest.id).first();
+        const changed = Buffer.from(row.envelope, 'base64url'); changed[changed.length - 1] ^= 1;
+        await db.prepare('UPDATE items SET envelope = ? WHERE id = ?').bind(changed.toString('base64url'), newest.id).run();
         await itemStore.load();
         const damaged = itemStore.getSnapshot().items.find(value => value.id === newest.id);
         assert.equal(damaged.decryptionError, true); assert.equal(damaged.text, '');
@@ -561,6 +576,45 @@ test('Worker API with real local D1 and R2', async t => {
       } finally {
         vaultStore.setAuthenticated(false); globalThis.fetch = previousFetch; globalThis.indexedDB = previousIDB; clientVault = await L.unlockEnrollment(clientEnrollment); L.activateVault(clientVault);
       }
+    });
+    await t.test('actual app encrypted image and binary uploads/downloads leak no file metadata or bytes', async () => {
+      await reset(); const originalFetch = globalThis.fetch;
+      const { dropApi } = await import(await moduleUrl('src/api/dropApi.ts'));
+      const { clearFileOutput } = await import(await moduleUrl('src/fileIO.ts'));
+      L.activateVault(clientVault);
+      const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jkZkAAAAASUVORK5CYII=', 'base64');
+      const uploads = [];
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/items/file') uploads.push(options);
+        return fetch(path, options);
+      };
+      try {
+        for (const [name, bytes, mime] of [['ảnh riêng.png', png, 'image/png'], ['secret firmware.bin', Buffer.from('private firmware bytes: 0123456789'), 'application/octet-stream']]) {
+          await dropApi.addFile(new File([bytes], name, { type: mime }));
+          const item = (await dropApi.list()).items.find(item => item.name === name); assert.ok(item); assert.equal(item.decryptionError, undefined);
+          assert.equal(item.mimeType, mime); assert.equal(item.size, bytes.length);
+          if (mime === 'image/png') assert.ok(item.previewUrl?.startsWith('blob:'));
+          assert.deepEqual(Buffer.from(await (await dropApi.downloadFile(item)).arrayBuffer()), bytes);
+          const row = await db.prepare('SELECT * FROM items WHERE id = ?').bind(item.id).first();
+          const stored = await bucket.get(row.file_key), object = Buffer.from(await stored.arrayBuffer());
+          for (const value of [name, mime]) {
+            assert.ok(!JSON.stringify(row).includes(value)); assert.ok(!JSON.stringify(stored.httpMetadata).includes(value)); assert.ok(!object.includes(Buffer.from(value)));
+          }
+          assert.ok(!object.includes(bytes)); assert.ok(!row.file_key.endsWith(item.id), 'R2 key is independently server-generated');
+          assert.equal(row.ciphertext_size, bytes.length + 112);
+          const headers = uploads.at(-1).headers;
+          assert.equal(headers['X-File-Name'], undefined); assert.equal(headers['X-File-Size'], undefined); assert.equal(headers['Content-Type'], 'application/octet-stream');
+          const raw = await fetch(item.url); assert.equal(raw.headers.get('content-type'), 'application/octet-stream');
+          assert.ok(!raw.headers.get('content-disposition').includes(name)); await raw.body.cancel();
+          await dropApi.remove(item.id); assert.equal(await bucket.head(row.file_key), null);
+          assert.equal(await db.prepare('SELECT id FROM items WHERE id = ?').bind(item.id).first(), null);
+        }
+        const valid = await filePayload('valid.bin', 'bytes');
+        const changed = Buffer.from(valid.body); changed[4] ^= 1;
+        assert.equal((await fetch('/api/items/file', { method: 'POST', headers: valid.headers, body: changed })).status, 400);
+        assert.equal((await fetch('/api/items/file', { method: 'POST', headers: { 'X-File-Name': 'legacy.bin', 'X-File-Size': '5', 'Content-Type': 'application/octet-stream' }, body: 'plain' })).status, 400);
+        assert.equal((await bucket.list()).objects.length, 0);
+      } finally { clearFileOutput(); globalThis.fetch = originalFetch; }
     });
     await t.test('metadata deletion failure retains a retryable tombstone after R2 removal', async () => {
       await reset();

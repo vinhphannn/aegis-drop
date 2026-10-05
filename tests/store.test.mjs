@@ -32,11 +32,13 @@ test('remote store uses the API and authoritative lists, preserves text and hand
       assert.ok(!options.body.includes('preserve whitespace'));
       serverItems = [{ id, type: 'text', envelope, createdAt: 1 }];
     } else if (path === '/api/items/file') {
-      assert.ok(options.body instanceof File, 'send binary File without base64 or multipart');
-      assert.equal(options.headers['X-File-Size'], String(options.body.size));
-      assert.equal(options.headers['X-File-Name'], encodeURIComponent(options.body.name));
-      serverItems = [{ id: 'file-id', type: 'file', name: options.body.name,
-        mimeType: options.body.type, size: options.body.size, url: '/api/items/file-id/file', createdAt: 2 }];
+      assert.ok(options.body instanceof Blob, 'send only frozen ciphertext Blob');
+      assert.equal(options.headers['Content-Type'], 'application/octet-stream');
+      assert.equal(options.headers['X-File-Name'], undefined); assert.equal(options.headers['X-File-Size'], undefined);
+      const bytes = new Uint8Array(await options.body.arrayBuffer());
+      const length = new DataView(bytes.buffer).getUint32(0), encoded = Buffer.from(bytes.subarray(4, 4 + length)).toString('base64url');
+      serverItems = [{ id: options.headers['X-Item-Id'], type: 'file', envelope: encoded,
+        url: `/api/items/${options.headers['X-Item-Id']}/file`, createdAt: 2 }];
     } else if (options.method === 'DELETE') serverItems = [];
     return Response.json({ ok: true });
   };
@@ -53,7 +55,7 @@ test('remote store uses the API and authoritative lists, preserves text and hand
     await itemStore.addFiles([new File(['binary'], 'ảnh.png', { type: 'image/png' })]);
     assert.equal(itemStore.getSnapshot().items.length, 1, 'use server list rather than merge local items');
     assert.equal(itemStore.getSnapshot().items[0].name, 'ảnh.png');
-    await itemStore.remove('file-id');
+    await itemStore.remove(itemStore.getSnapshot().items[0].id);
     assert.equal(itemStore.getSnapshot().items.length, 0);
     failListOnce = true;
     await itemStore.addText('already saved');
@@ -101,7 +103,7 @@ test('remote store uses the API and authoritative lists, preserves text and hand
 
 test('history loads only on request, appends and deduplicates, retries failures and serializes requests', async () => {
   const originalFetch = globalThis.fetch;
-  const item = (id, createdAt) => ({ id, createdAt, type: 'file', name: id, size: 0, mimeType: 'application/octet-stream', url: `/api/items/${id}/file` });
+  const item = (id, createdAt) => ({ id, createdAt, type: 'file', envelope: 'bad', url: `/api/items/${id}/file` });
   const calls = [];
   let failOlder = false;
   let release;

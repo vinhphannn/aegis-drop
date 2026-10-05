@@ -1,18 +1,16 @@
 import { authStore } from '../auth';
 import type { DropItem, FileItem, ItemPage } from '../model';
 import { DEFAULT_PAGE_SIZE } from '../model';
-import { decryptVaultText, encryptVaultText } from '../localVault';
+import { openVaultFile, decryptVaultText, encryptVaultText } from '../localVault';
 
-type RemoteItem = FileItem | { id: string; type: 'text'; createdAt: number; envelope?: unknown };
+import { decryptedDownload, encryptedUpload, localPreview } from '../fileIO';
+
+type RemoteItem = { id: string; type: 'text' | 'file'; createdAt: number; envelope?: unknown; url?: unknown };
 function isItem(value: unknown): value is RemoteItem {
   if (!value || typeof value !== 'object' || !('id' in value) || typeof value.id !== 'string' ||
     !('createdAt' in value) || typeof value.createdAt !== 'number' || !Number.isSafeInteger(value.createdAt) ||
     Math.abs(value.createdAt) > 8.64e15 || !('type' in value)) return false;
-  if (value.type === 'text') return true; // Validate/decrypt each envelope independently below.
-  return value.type === 'file' && 'name' in value && typeof value.name === 'string' &&
-    'size' in value && typeof value.size === 'number' && Number.isSafeInteger(value.size) && value.size >= 0 &&
-    'mimeType' in value && typeof value.mimeType === 'string' &&
-    'url' in value && value.url === `/api/items/${value.id}/file`;
+  return value.type === 'text' || value.type === 'file'; // Each envelope is independently authenticated below.
 }
 
 async function request(path: string, options?: RequestInit) {
@@ -34,7 +32,17 @@ export const dropApi = {
       data.items.length > DEFAULT_PAGE_SIZE || !data.items.every(isItem) || !('nextCursor' in data) ||
       (data.nextCursor !== null && (typeof data.nextCursor !== 'string' || !data.nextCursor))) throw new Error('Invalid item list response.');
     const items: DropItem[] = await Promise.all(data.items.map(async value => {
-      if (value.type !== 'text') return value;
+      if (value.type === 'file') {
+        const base: FileItem = { id: value.id, type: 'file', createdAt: value.createdAt, name: 'Encrypted file', size: 0,
+          mimeType: 'application/octet-stream', envelope: typeof value.envelope === 'string' ? value.envelope : '',
+          url: `/api/items/${value.id}/file` };
+        try {
+          if (value.url !== base.url) throw new Error('Invalid file route.');
+          const opened = await openVaultFile(value.id, value.envelope);
+          const item = { ...base, name: opened.manifest.name, size: opened.manifest.size, mimeType: opened.manifest.mimeType };
+          return { ...item, previewUrl: await localPreview(item, (url, signal) => request(url, { signal })) };
+        } catch { return { ...base, decryptionError: true }; }
+      }
       const base = { id: value.id, type: 'text' as const, createdAt: value.createdAt };
       try { return { ...base, text: await decryptVaultText(value.id, value.envelope) }; }
       catch { return { ...base, text: '', decryptionError: true }; }
@@ -46,11 +54,13 @@ export const dropApi = {
     await request('/api/items/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   },
   async addFile(file: File) {
-    await request('/api/items/file', { method: 'POST', body: file, headers: {
-      'Content-Type': file.type || 'application/octet-stream',
-      'X-File-Name': encodeURIComponent(file.name || 'clipboard-image.png'),
-      'X-File-Size': String(file.size),
+    const encrypted = await encryptedUpload(file);
+    await request('/api/items/file', { method: 'POST', body: encrypted.body, headers: {
+      'Content-Type': 'application/octet-stream', 'X-Item-Id': encrypted.id, 'X-Ciphertext-Size': String(encrypted.ciphertextSize),
     } });
+  },
+  async downloadFile(item: FileItem, signal?: AbortSignal) {
+    return decryptedDownload(item, (url, signal) => request(url, { signal }), signal);
   },
   async remove(id: string) { await request(`/api/items/${encodeURIComponent(id)}`, { method: 'DELETE' }); },
 };

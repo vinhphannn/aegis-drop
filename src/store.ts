@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from 'react';
 import { dropApi } from './api/dropApi';
+import { clearFileOutput, disposePreviews } from './fileIO';
 import type { DropItem } from './model';
-export { MAX_FILE_SIZE } from './model';
+export { BROWSER_FILE_LIMIT as MAX_FILE_SIZE } from './model';
 export type { DropItem, TextItem, FileItem } from './model';
 
 interface StoreState { items: readonly DropItem[]; nextCursor: string | null; loading: boolean; loadingOlder: boolean; busy: boolean; error: string | null }
@@ -11,6 +12,7 @@ const listeners = new Set<() => void>();
 let generation = 0;
 let pendingLoad: Promise<void> | null = null;
 function update(patch: Partial<StoreState>) {
+  if (patch.items) disposePreviews(state.items, patch.items);
   state = { ...state, ...patch };
   listeners.forEach(listener => listener());
 }
@@ -19,6 +21,7 @@ async function refresh(epoch = generation) {
   if (epoch !== generation) return;
   const page = await dropApi.list();
   if (epoch === generation) update({ ...page, error: null });
+  else disposePreviews(page.items);
 }
 async function mutate(action: () => Promise<void>) {
   if (state.busy || state.loading || state.loadingOlder) throw new Error('Please wait for the current request.');
@@ -48,7 +51,7 @@ export const itemStore = {
   subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
   getSnapshot: () => state,
   reset() {
-    generation++;
+    generation++; clearFileOutput();
     pendingLoad = null;
     update({ items: [], nextCursor: null, loading: true, loadingOlder: false, busy: false, error: null });
   },
@@ -68,10 +71,11 @@ export const itemStore = {
     update({ loadingOlder: true, error: null });
     try {
       const page = await dropApi.list(cursor);
-      if (epoch !== generation) return;
+      if (epoch !== generation) { disposePreviews(page.items); return; }
       const unique = new Map(state.items.map(item => [item.id, item]));
       for (const item of page.items) if (!unique.has(item.id)) unique.set(item.id, item);
       const items = [...unique.values()].sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+      disposePreviews(page.items, items);
       update({ items, nextCursor: page.nextCursor });
     } catch (error) { if (epoch === generation) update({ error: message(error) }); }
     finally { if (epoch === generation) update({ loadingOlder: false }); }

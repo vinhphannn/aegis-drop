@@ -6,7 +6,7 @@ export default function VaultGate() {
   const vault = useVault(), auth = useAuth();
   if (vault.status === 'unlocked') return <>
     <div className="shell vault-toolbar">
-      <div><strong>Local vault unlocked</strong><p>Text is end-to-end encrypted. Files are not encrypted yet.</p></div>
+      <div><strong>Local vault unlocked</strong><p>Text and files are end-to-end encrypted.</p></div>
       <button className="refresh" onClick={() => vaultStore.lock()}>Lock vault</button>
     </div>
     <App />
@@ -24,7 +24,7 @@ export default function VaultGate() {
       {empty ? <button className="send" disabled={vault.busy} onClick={() => { void vaultStore.bootstrap(); }}>{vault.busy ? 'Creating…' : 'Create local vault'}</button>
         : vault.status === 'locked' ? <button className="send" disabled={vault.busy} onClick={() => { void vaultStore.unlock(); }}>{vault.busy ? 'Unlocking…' : 'Unlock local vault'}</button>
         : <button className="refresh" disabled={vault.busy} onClick={() => { void vaultStore.check(); }}>Check again</button>}
-      <p className="vault-note">Text requires this browser’s vault. File encryption is not available yet.</p>
+      <p className="vault-note">Text and files require this browser’s vault.</p>
     </section>}
     <p className="status" role="status">{vault.error || auth.error}</p>
   </main>;

@@ -4,11 +4,11 @@ import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '../src/model';
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export interface Env { DB: D1Database; FILES: R2Bucket; ASSETS: Fetcher; ACCESS_KEY_SHA256: string; SESSION_SECRET: string }
 export interface ItemRow {
-  id: string; type: 'text' | 'file'; text_envelope: string | null;
-  file_key: string | null; file_name: string | null; mime_type: string | null;
-  size: number; created_at: number; pending_delete: number;
+  id: string; type: 'text' | 'file'; envelope: string | null;
+  file_key: string | null;
+  ciphertext_size: number; created_at: number; pending_delete: number;
 }
-export type NewItem = Pick<ItemRow, 'id' | 'type' | 'text_envelope' | 'file_key' | 'file_name' | 'mime_type' | 'size'>;
+export type NewItem = Pick<ItemRow, 'id' | 'type' | 'envelope' | 'file_key' | 'ciphertext_size'>;
 interface Cursor { v: 1; t: number; id: string }
 interface PageOptions { limit: number; before: Cursor | null }
 function encodeCursor(t: number, id: string) {
@@ -42,18 +42,17 @@ export async function listItems(env: Env, page: PageOptions): Promise<EncryptedI
   const last = rows.at(-1);
   return {
     items: rows.map(row => row.type === 'text'
-      ? { id: row.id, type: 'text', createdAt: row.created_at, envelope: row.text_envelope! }
-      : { id: row.id, type: 'file', createdAt: row.created_at, name: row.file_name!,
-        size: row.size, mimeType: row.mime_type!, url: `/api/items/${row.id}/file` }),
+      ? { id: row.id, type: 'text', createdAt: row.created_at, envelope: row.envelope! }
+      : { id: row.id, type: 'file', createdAt: row.created_at, envelope: row.envelope!,
+        ciphertextSize: row.ciphertext_size, url: `/api/items/${row.id}/file` }),
     nextCursor: results.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
   };
 }
 
 export async function insertItem(env: Env, item: NewItem) {
   // One insert; history is never pruned merely because new items arrive.
-  await env.DB.prepare(`INSERT INTO items (id, type, text_envelope, file_key, file_name, mime_type, size)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(item.id, item.type, item.text_envelope,
-    item.file_key, item.file_name, item.mime_type, item.size).run();
+  await env.DB.prepare(`INSERT INTO items (id, type, envelope, file_key, ciphertext_size)
+    VALUES (?, ?, ?, ?, ?)`).bind(item.id, item.type, item.envelope, item.file_key, item.ciphertext_size).run();
 }
 
 export async function cleanup(env: Env) {

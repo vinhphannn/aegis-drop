@@ -10,12 +10,12 @@ export function encodeTextEnvelope(bytes: Uint8Array) {
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
-export function parseTextEnvelope(id: string, encoded: unknown) {
+export function parseTextEnvelope(id: string, encoded: unknown, kind: 0 | 1 = 0) {
   requireValue(typeof encoded === 'string' && encoded.length <= Math.ceil(MAX_ENVELOPE_BYTES * 4 / 3) && /^[A-Za-z0-9_-]+$/.test(encoded));
   const binary = atob(encoded.replace(/-/g, '+').replace(/_/g, '/'));
   const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
   requireValue(encodeTextEnvelope(bytes) === encoded);
   const header = decodeHeader(decodeEnvelope(bytes).header);
-  requireValue(header.storageKind === 0 && itemIdString(header.itemId) === id);
+  requireValue(header.storageKind === kind && itemIdString(header.itemId) === id);
   return { bytes, header };
 }

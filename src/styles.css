@@ -351,6 +351,9 @@ h2 span {
 }
 
 .image-preview {
+  padding:0;
+  border:0;
+  width:100%;
   display:block;
   margin-bottom:16px;
   background:#0e120e;

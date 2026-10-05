@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import Peer from 'peerjs';
 import type { DataConnection } from 'peerjs';
 import QRCode from 'qrcode';
+import { checkVersion } from './version';
 import { DirectPeer, validateSendFile } from './peer';
 import type { ReceivedItem, FileTransfer } from './peer';
 
@@ -46,6 +47,7 @@ export default function App() {
     const accept = (connection: DataConnection) => {
       if (livePeers.has(connection.peer)) { connection.close(); return; }
       const store = new DirectPeer(local.current);
+      store.onVersionMismatch = () => { void checkVersion(fileBusy.current).then(message => { if (alive && message) setMessage(message); }); };
       livePeers.set(connection.peer, { connection, store });
       stores.set(connection.connectionId, store);
       if (connection.peer === HOST_ID) store.onPeers = ids => {
@@ -98,6 +100,21 @@ export default function App() {
       }
       stores.clear(); peer.destroy();
     };
+  }, []);
+  useEffect(() => {
+    let alive = true, checking = false;
+    const check = async () => {
+      if (checking || document.visibilityState === 'hidden') return;
+      checking = true;
+      const busy = fileBusy.current || [...connections.current.values()].some(store => !!store.getSnapshot().sending || !!store.getSnapshot().receiving);
+      const result = await checkVersion(busy);
+      checking = false;
+      if (alive && result) setMessage(result);
+    };
+    const timer = setInterval(() => { void check(); }, 30000);
+    const resume = () => { void check(); };
+    window.addEventListener('focus', resume); document.addEventListener('visibilitychange', resume);
+    return () => { alive = false; clearInterval(timer); window.removeEventListener('focus', resume); document.removeEventListener('visibilitychange', resume); };
   }, []);
   useEffect(() => {
     if (!panel) return;

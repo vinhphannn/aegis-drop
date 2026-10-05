@@ -196,3 +196,15 @@ test('verified progress, repeat file selection, checksum corruption and interrup
     });
   } finally { peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
 });
+
+
+test('old clients are rejected before sending unverified files', async () => {
+  try {
+    const { a, b } = await connect();
+    let mismatch = false; b.onVersionMismatch = () => { mismatch = true; };
+    a.channel.send(JSON.stringify({ v: 1, session: a.session, type: 'hello' }));
+    await until(() => b.getSnapshot().status === 'failed');
+    assert.equal(mismatch, true);
+    assert.match(b.getSnapshot().error, /older version/);
+  } finally { peers.splice(0).forEach(peer => peer.disconnect()); connections.splice(0).forEach(pc => pc.close()); }
+});

@@ -1,3 +1,4 @@
+import { APP_VERSION } from './version';
 export const CHUNK_BYTES = 16 * 1024;
 export const MAX_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
@@ -124,6 +125,7 @@ export class DirectPeer {
     this.update({ transfers: this.state.transfers.map(item => ['sent', 'received', 'failed'].includes(item.phase) ? item : { ...item, phase: 'failed', error: message }) });
     this.disconnect(); this.update({ status: 'failed', error: message });
   }
+  onVersionMismatch?: () => void;
   onPeers?: (peers: string[]) => void;
   sendPeers(peers: string[]) { this.ready(); this.control({ type: 'peers', peers }); }
   setStatus(status: PeerState['status'], error: string | null = null) { this.update({ status, error }); }
@@ -136,7 +138,7 @@ export class DirectPeer {
     if (this.channel && this.channel !== channel) { channel.close(); return; }
     check(channel.ordered);
     this.channel = channel; channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = LOW_WATER;
-    const opened = () => { if (epoch === this.epoch) this.control({ type: 'hello', device: this.localDevice }); };
+    const opened = () => { if (epoch === this.epoch) this.control({ type: 'hello', device: this.localDevice, protocol: 2, appVersion: APP_VERSION }); };
     channel.addEventListener('open', opened);
     channel.addEventListener('close', () => { if (epoch === this.epoch) this.fail(new Error('Connection closed. Reload to reconnect.')); });
     channel.addEventListener('error', () => { if (epoch === this.epoch) this.fail(new Error('Data transfer failed.')); });
@@ -171,6 +173,10 @@ export class DirectPeer {
     check(data.length <= MAX_CONTROL_BYTES && encoder.encode(data).length <= MAX_CONTROL_BYTES);
     const value = JSON.parse(data); check(value && value.v === 1 && value.session === this.session);
     if (value.type === 'hello') {
+      if (value.protocol !== 2 || value.appVersion !== APP_VERSION) {
+        this.onVersionMismatch?.();
+        throw new Error('Other device uses an older version. Reload both devices.');
+      }
       if (value.device) check(typeof value.device.id === 'string' && uuid.test(value.device.id) && typeof value.device.label === 'string' && value.device.label.length <= 80);
       this.hello = true; this.update({ status: 'connected', error: null, device: value.device }); return;
     }

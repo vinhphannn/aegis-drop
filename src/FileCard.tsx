@@ -3,6 +3,7 @@ import { preview } from './peer';
 import type { FileTransfer } from './peer';
 import type { HistoryItem } from './history';
 import { HistoryStore } from './history';
+import ItemTime from './ItemTime';
 
 export function formatSize(bytes: number) { return bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 export default function FileCard({ item, transfer, history, error }: { item?: Extract<HistoryItem, { type: 'file' }>; transfer?: FileTransfer; history: HistoryStore; error: (message: string) => void }) {
@@ -49,6 +50,7 @@ export default function FileCard({ item, transfer, history, error }: { item?: Ex
     } catch { error('Copy image unavailable.'); }
   }
   return <article ref={root}>
+    <ItemTime createdAt={item?.createdAt ?? transfer!.createdAt} />
     {imageUrl && <img className="preview" src={imageUrl} alt={name} />}
     <p>{name} <small>{formatSize(size)}</small></p><p className={phase === 'failed' ? 'error' : 'progress'} role="status">{label}</p>
     {(phase === 'sending' || phase === 'receiving') && <progress aria-label={`${name} transfer progress`} value={transfer!.bytes} max={size || 1} />}

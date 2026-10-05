@@ -8,6 +8,7 @@ import type { FileTransfer } from './peer';
 import { HistoryStore } from './history';
 import { HistorySync } from './sync';
 import FileCard from './FileCard';
+import ItemTime from './ItemTime';
 
 const history = new HistoryStore();
 
@@ -33,6 +34,8 @@ export default function App() {
   const fileBusy = useRef(false);
   const disconnectActions = useRef(new Map<string, () => void>());
   const connections = useRef(new Map<string, DirectPeer>());
+  const dragDepth = useRef(0);
+  const composerInput = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null), panelRoot = useRef<HTMLDivElement>(null);
   const local = useRef<{ id: string; label: string }>({ id: crypto.randomUUID(), label: deviceLabel() });
   useEffect(() => {
@@ -199,6 +202,43 @@ export default function App() {
     try { await history.createText(text); setText(''); setMessage(''); }
     catch (error) { setMessage(error instanceof Error ? error.message : 'Could not save text.'); }
   }
+  useEffect(() => {
+    const input = composerInput.current;
+    if (!input) return;
+    input.style.height = 'auto';
+    input.style.height = `${Math.min(128, Math.max(36, input.scrollHeight))}px`;
+  }, [text]);
+  useEffect(() => {
+    const hasFiles = (event: DragEvent) => !!event.dataTransfer && Array.from(event.dataTransfer.types).includes('Files');
+    const enter = (event: DragEvent) => { if (hasFiles(event)) { event.preventDefault(); dragDepth.current++; setDragging(true); } };
+    const over = (event: DragEvent) => { if (hasFiles(event)) { event.preventDefault(); event.dataTransfer!.dropEffect = 'copy'; setDragging(true); } };
+    const leave = () => { dragDepth.current = Math.max(0, dragDepth.current - 1); if (!dragDepth.current) setDragging(false); };
+    const clear = () => { dragDepth.current = 0; setDragging(false); };
+    const drop = (event: DragEvent) => {
+      clear();
+      if (!hasFiles(event)) return;
+      event.preventDefault(); void files(Array.from(event.dataTransfer!.files));
+    };
+    const paste = (event: ClipboardEvent) => {
+      const data = event.clipboardData; if (!data) return;
+      const list = Array.from(data.files);
+      if (list.length) { event.preventDefault(); void files(list); return; }
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('input, textarea, [contenteditable="true"]')) return;
+      const pasted = data.getData('text/plain');
+      if (pasted) { event.preventDefault(); setText(current => current + pasted); composerInput.current?.focus(); }
+    };
+    document.addEventListener('dragenter', enter); document.addEventListener('dragover', over);
+    document.addEventListener('dragleave', leave); document.addEventListener('drop', drop);
+    document.addEventListener('dragend', clear); document.addEventListener('paste', paste);
+    window.addEventListener('blur', clear);
+    return () => {
+      document.removeEventListener('dragenter', enter); document.removeEventListener('dragover', over);
+      document.removeEventListener('dragleave', leave); document.removeEventListener('drop', drop);
+      document.removeEventListener('dragend', clear); document.removeEventListener('paste', paste);
+      window.removeEventListener('blur', clear);
+    };
+  });
   return <main className="shell">
     <header><span className="brand">AEGIS DROP</span><div className="header-actions" ref={panelRoot}>
       <button aria-expanded={panel === 'devices'} onClick={() => setPanel(panel === 'devices' ? null : 'devices')}>Devices</button>
@@ -206,21 +246,23 @@ export default function App() {
       {panel === 'share' && <div className="popover share" role="dialog" aria-label="Share">{qr && <img src={qr} alt="Connection QR code" />}<button disabled={!link} onClick={() => { void navigator.clipboard.writeText(link).catch(() => setMessage('Copy failed.')); }}>Copy link</button></div>}
       {panel === 'devices' && <div className="popover devices" role="dialog" aria-label="Connected devices"><h2>Connected devices</h2><div className="device"><span>● {local.current.label} <small>(This device)</small></span></div>{connected.map(([id, store]) => <div className="device" key={id}><span>● {store.getSnapshot().device?.label ?? 'Browser'}</span><button onClick={() => disconnectActions.current.get(id)?.()}>Disconnect</button></div>)}</div>}
     </div></header>
-    <div className={`composer ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); void files(Array.from(event.dataTransfer.files)); }}>
-      <textarea aria-label="Message" placeholder="Paste text, image or drop a file..." value={text} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} onPaste={event => { const list = Array.from(event.clipboardData.files); if (list.length) { event.preventDefault(); void files(list); } }} />
-      <button className="attach" aria-label="Choose files" onClick={() => {
+    {dragging && <div className="page-drop" aria-hidden="true">Drop files or images</div>}
+    <form className={`composer ${dragging ? 'dragging' : ''}`} onSubmit={event => { event.preventDefault(); void send(); }}>
+      <button type="button" className="attach" aria-label="Choose files or images" title="Choose files or images" onClick={() => {
         try { if (!picker.current) throw new Error(); picker.current.click(); }
         catch { setMessage('Could not open file picker.'); }
       }}>+</button>
+      <textarea ref={composerInput} rows={1} aria-label="Message" placeholder="Paste text, image or drop a file..." value={text} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} />
+      <button type="submit" className="send-button" disabled={sending || !text.trim()} aria-label="Send message">Send <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m5 12 14-7-5 14-3-6-6-1Z" /><path d="m11 13 8-8" /></svg></button>
       <input hidden ref={picker} type="file" multiple onChange={event => {
         try { void files(Array.from(event.target.files ?? [])); }
         catch { setMessage('Could not read file selection.'); }
         finally { event.target.value = ''; }
       }} />
-    </div>
+    </form>
     {syncStatus && <p className="progress" role="status">{syncStatus}</p>}
     <section className="items">{recent.map(entry => {
-      if ('type' in entry && entry.type === 'text') return <article key={entry.id}><pre>{entry.text}</pre><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></article>;
+      if ('type' in entry && entry.type === 'text') return <article key={entry.id}><ItemTime createdAt={entry.createdAt} /><pre>{entry.text}</pre><div className="item-actions"><button onClick={() => { void navigator.clipboard.writeText(entry.text).catch(() => setMessage('Copy failed.')); }}>Copy</button></div></article>;
       const item = 'type' in entry && entry.type === 'file' ? entry : undefined;
       const transfer = grouped.get(entry.id);
       return <FileCard key={entry.id} item={item} transfer={transfer ?? (!('type' in entry) ? entry : undefined)} history={history} error={setMessage} />;

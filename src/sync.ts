@@ -7,14 +7,27 @@ export class HistorySync {
   private peers = new Map<DirectPeer, SyncPeer>();
   readonly reservations = new Map<string, SyncPeer>();
   private off: () => void;
-  constructor(readonly history: HistoryStore, private readonly feedback: (message: string) => void, readonly error: (message: string) => void) {
+  private wasBusy = false;
+  private failedCycle = false;
+  private disposed = false;
+  constructor(readonly history: HistoryStore, private readonly feedback: (message: string) => void, private readonly errorFeedback: (message: string) => void) {
     this.off = history.onAdded(item => {
       const owner = this.reservations.get(item.id);
       this.reservations.delete(item.id); owner?.received(item.id);
       for (const peer of this.peers.values()) peer.announce(item);
     });
   }
-  status() { this.feedback(this.reservations.size || [...this.peers.values()].some(peer => peer.busy) ? 'Syncing…' : 'Synced'); }
+  error = (message: string) => {
+    this.failedCycle = true; this.feedback(''); this.errorFeedback(message);
+  };
+  status() {
+    if (this.disposed) return;
+    const busy = this.reservations.size > 0 || [...this.peers.values()].some(peer => peer.busy);
+    if (busy === this.wasBusy) return;
+    this.wasBusy = busy;
+    if (busy) { this.failedCycle = false; this.feedback('Syncing…'); }
+    else this.feedback(!this.failedCycle && this.peers.size > 0 ? 'Synced' : '');
+  }
   attach(store: DirectPeer) {
     const peer = new SyncPeer(this, store); this.peers.set(store, peer); peer.start();
   }
@@ -25,7 +38,7 @@ export class HistorySync {
     for (const other of this.peers.values()) void other.reconsider().catch(error => this.error(error instanceof Error ? error.message : 'History sync failed.'));
     this.status();
   }
-  dispose() { this.off(); for (const peer of [...this.peers.values()]) peer.dispose(); this.peers.clear(); this.reservations.clear(); }
+  dispose() { this.disposed = true; this.off(); for (const peer of [...this.peers.values()]) peer.dispose(); this.peers.clear(); this.reservations.clear(); }
 }
 class SyncPeer {
   private stopped = false;
@@ -35,9 +48,11 @@ class SyncPeer {
   private timer?: ReturnType<typeof setTimeout>;
   private outgoing: string[] = [];
   private processing = false;
+  private inventoryPending = false;
+  private advertising = false;
   private off?: () => void;
   private incomingChain = Promise.resolve();
-  get busy() { return !!this.requested || this.processing || this.missing.length > 0; }
+  get busy() { return this.inventoryPending || this.advertising || !!this.requested || this.processing || this.missing.length > 0; }
   constructor(private readonly manager: HistorySync, readonly store: DirectPeer) {}
   start() {
     this.store.persistItem = async (item, blob) => {
@@ -54,7 +69,7 @@ class SyncPeer {
       const state = this.store.getSnapshot();
       if (this.requested && state.transfers.some(item => item.id === this.requested && ['receiving', 'verifying'].includes(item.phase))) this.armTimeout();
       if (state.status === 'connected' && !connected) {
-        connected = true;
+        connected = true; this.inventoryPending = true; this.manager.status();
         void this.inventory().catch(error => this.report(error));
       } else if (connected && state.status !== 'connected') this.dispose();
     };
@@ -63,16 +78,19 @@ class SyncPeer {
   private report(error: unknown) { this.manager.error(error instanceof Error ? error.message : 'History sync failed.'); }
   async inventory() {
     if (this.stopped || this.store.getSnapshot().status !== 'connected') return;
-    let after: string | undefined;
-    do {
-      const page = await this.manager.history.inventoryPage(after);
-      if (this.stopped) return;
-      this.store.sendHistory({ type: 'inventory', items: page });
-      if (page.length < 48) break;
-      after = page.at(-1)!.id;
-    } while (!this.stopped);
-    this.manager.status();
+    this.advertising = true; this.manager.status();
+    try {
+      let after: string | undefined;
+      do {
+        const page = await this.manager.history.inventoryPage(after);
+        if (this.stopped) return;
+        this.store.sendHistory({ type: 'inventory', items: page, complete: page.length < 48 });
+        if (page.length < 48) break;
+        after = page.at(-1)!.id;
+      } while (!this.stopped);
+    } finally { this.advertising = false; this.manager.status(); }
   }
+
   announce(item: InventoryItem) {
     if (this.stopped || this.store.getSnapshot().status !== 'connected') return;
     try { this.store.sendHistory({ type: 'inventory', items: [{ id: item.id, createdAt: item.createdAt, type: item.type, ...(item.type === 'file' ? { size: item.size, hash: item.hash } : {}) }] }); }
@@ -90,6 +108,7 @@ class SyncPeer {
         }
       }
       await this.manager.history.refresh();
+      if (message.complete !== false) this.inventoryPending = false;
       await this.next();
     } else if (message.type === 'item-request') {
       if (typeof message.id !== 'string' || !uuid.test(message.id)) throw new Error('Invalid history request.');
@@ -151,6 +170,6 @@ class SyncPeer {
   }
   dispose() {
     if (this.stopped) return;
-    this.stopped = true; clearTimeout(this.timer); this.off?.(); this.manager.release(this);
+    this.stopped = true; this.inventoryPending = false; this.advertising = false; clearTimeout(this.timer); this.off?.(); this.manager.release(this);
   }
 }

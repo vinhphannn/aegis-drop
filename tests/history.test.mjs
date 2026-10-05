@@ -16,8 +16,9 @@ async function until(fn, timeout = 15000) {
 async function history(name = crypto.randomUUID()) { const store = new HistoryStore(name, factory); await store.ready; cleanup.push(() => store.close()); return store; }
 async function connect(aHistory, bHistory) {
   const errors = [];
-  const syncA = new HistorySync(aHistory, () => {}, error => errors.push(error));
-  const syncB = new HistorySync(bHistory, () => {}, error => errors.push(error));
+  const feedbackA = [], feedbackB = [];
+  const syncA = new HistorySync(aHistory, message => feedbackA.push(message), error => errors.push(error));
+  const syncB = new HistorySync(bHistory, message => feedbackB.push(message), error => errors.push(error));
   const a = new DirectPeer({ id: aHistory.deviceId, label: 'A' }), b = new DirectPeer({ id: bHistory.deviceId, label: 'B' });
   syncA.attach(a); syncB.attach(b);
   const pcA = new wrtc.RTCPeerConnection({ iceServers: [] }), pcB = new wrtc.RTCPeerConnection({ iceServers: [] });
@@ -31,7 +32,7 @@ async function connect(aHistory, bHistory) {
   await until(() => a.getSnapshot().status === 'connected' && b.getSnapshot().status === 'connected');
   let closed = false;
   const close = () => { if (closed) return; closed = true; syncA.dispose(); syncB.dispose(); a.disconnect(); b.disconnect(); pcA.close(); pcB.close(); };
-  cleanup.push(close); return { a, b, close, errors };
+  cleanup.push(close); return { a, b, close, errors, syncA, syncB, feedbackA, feedbackB };
 }
 async function count(store) { let n = 0, after; for (;;) { const page = await store.inventoryPage(after); n += page.length; if (page.length < 48) return n; after = page.at(-1).id; } }
 
@@ -110,5 +111,27 @@ test('live offline-created items propagate automatically and corrupted sync data
     await until(async () => !!(await bHistory.get(file.id)));
     assert.equal(await checksum(await bHistory.blob(file.id)), file.hash);
     assert.deepEqual(repaired.errors, []);
+  } finally { for (const close of cleanup.splice(0).reverse()) await close(); }
+});
+
+
+test('idle inventory messages do not repeatedly announce Synced', async () => {
+  try {
+    const a = await history(), b = await history();
+    const pair = await connect(a, b);
+    await until(() => pair.feedbackA.includes('Synced') && pair.feedbackB.includes('Synced'));
+    const before = [pair.feedbackA.length, pair.feedbackB.length];
+    for (let i = 0; i < 10; i++) {
+      pair.syncA.status(); pair.syncB.status();
+      pair.a.sendHistory({ type: 'inventory', items: [], complete: true });
+      pair.b.sendHistory({ type: 'inventory', items: [], complete: true });
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual([pair.feedbackA.length, pair.feedbackB.length], before);
+    assert.equal(pair.feedbackA.filter(value => value === 'Synced').length, 1);
+    const item = await a.createText('one new sync cycle');
+    await until(async () => !!(await b.get(item.id)));
+    await until(() => pair.feedbackB.filter(value => value === 'Synced').length === 2);
+    assert.deepEqual(pair.errors, []);
   } finally { for (const close of cleanup.splice(0).reverse()) await close(); }
 });
